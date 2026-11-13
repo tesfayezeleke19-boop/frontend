@@ -905,6 +905,7 @@ export default function CreditContractDetail() {
       {/* Payment information dialog */}
       {isFinance && financialOpen && report && (
         <ContractPaymentDialog
+          contractId={contract.id}
           contractNumber={contract.contractNumber}
           report={report}
           onClose={() => setFinancialOpen(false)}

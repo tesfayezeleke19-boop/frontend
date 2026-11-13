@@ -19,5 +19,4 @@ export {
 } from "./leaveRepository";
 export {
   payrollRepository,
-  type PayrollConfig,
 } from "./payrollRepository";
