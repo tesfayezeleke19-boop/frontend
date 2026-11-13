@@ -1,0 +1,17 @@
+{
+  "name": "NexERP — Enterprise Resource Planning",
+  "short_name": "NexERP",
+  "description": "Centralized ERP for Sales, Finance, and Admin operations",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0b",
+  "theme_color": "#0a0a0b",
+  "icons": [
+    {
+      "src": "/logo.png",
+      "sizes": "any",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

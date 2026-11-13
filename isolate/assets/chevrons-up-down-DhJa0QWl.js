@@ -1,0 +1,1 @@
+import{c as o}from"./index-DQYJ6IbN.js";const e=[["path",{d:"m15 18-6-6 6-6",key:"1wnfg3"}]],c=o("chevron-left",e);const n=[["path",{d:"m7 15 5 5 5-5",key:"1hf1tw"}],["path",{d:"m7 9 5-5 5 5",key:"sgt6xg"}]],s=o("chevrons-up-down",n);export{c as C,s as a};

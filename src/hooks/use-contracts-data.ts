@@ -1,0 +1,124 @@
+/**
+ * React hooks for the Contract Orders repository.
+ *
+ * Hook consumers never touch storage: they read through the repository and
+ * re-fetch whenever contract data changes (or when a Sales Invoice change
+ * affects a converted contract's invoice link).
+ */
+import { useCallback, useEffect, useState } from "react";
+import { subscribeSales } from "@/services/sales/storage";
+import { contractsRepository } from "@/services/contracts/repository";
+import { subscribeContracts } from "@/services/contracts/storage";
+import type {
+  Contract,
+  ContractOrder,
+  ContractProgress,
+} from "@/services/contracts/types";
+import type { ContractFinancialReport } from "@/services/contracts/financials";
+
+export interface RepoState<T> {
+  data: T | null;
+  loading: boolean;
+  error: Error | null;
+}
+
+function useContractData<T>(loader: () => Promise<T>): RepoState<T> {
+  const [state, setState] = useState<RepoState<T>>({
+    data: null,
+    loading: true,
+    error: null,
+  });
+
+  useEffect(() => {
+    let active = true;
+
+    const load = () => {
+      loader().then(
+        (data) => {
+          if (active) setState({ data, loading: false, error: null });
+        },
+        (error: unknown) => {
+          if (active) {
+            setState({
+              data: null,
+              loading: false,
+              error: error instanceof Error ? error : new Error(String(error)),
+            });
+          }
+        },
+      );
+    };
+
+    load();
+    const unsubscribeContracts = subscribeContracts(load);
+    const unsubscribeSales = subscribeSales(load);
+    return () => {
+      active = false;
+      unsubscribeContracts();
+      unsubscribeSales();
+    };
+  }, [loader]);
+
+  return state;
+}
+
+export function useContracts(): RepoState<Contract[]> {
+  const loader = useCallback(() => contractsRepository.getContracts(), []);
+  return useContractData(loader);
+}
+
+export function useContract(
+  id: string | undefined,
+): RepoState<Contract | null> {
+  const loader = useCallback(
+    () =>
+      id ? contractsRepository.getContractById(id) : Promise.resolve(null),
+    [id],
+  );
+  return useContractData(loader);
+}
+
+export function useContractOrders(
+  contractId: string | undefined,
+): RepoState<ContractOrder[]> {
+  const loader = useCallback(
+    () =>
+      contractId
+        ? contractsRepository.getContractOrders(contractId)
+        : Promise.resolve([]),
+    [contractId],
+  );
+  return useContractData(loader);
+}
+
+export function useAllContractOrders(): RepoState<ContractOrder[]> {
+  const loader = useCallback(() => contractsRepository.getAllOrders(), []);
+  return useContractData(loader);
+}
+
+export function useContractProgress(
+  contractId: string | undefined,
+): RepoState<ContractProgress | null> {
+  const loader = useCallback(
+    () =>
+      contractId
+        ? contractsRepository.getContractProgress(contractId)
+        : Promise.resolve(null),
+    [contractId],
+  );
+  return useContractData(loader);
+}
+
+/** Payment, withholding and the completed-contract financial report. */
+export function useContractFinancialReport(
+  contractId: string | undefined,
+): RepoState<ContractFinancialReport | null> {
+  const loader = useCallback(
+    () =>
+      contractId
+        ? contractsRepository.getFinancialReport(contractId)
+        : Promise.resolve(null),
+    [contractId],
+  );
+  return useContractData(loader);
+}
