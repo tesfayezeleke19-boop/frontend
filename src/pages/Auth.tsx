@@ -130,12 +130,11 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
         <ThemeToggle />
       </header>
 
-      
       {/* Sign-in form */}
-      <div className="flex flex-1 items-center justify-center px-6 pb-16">
+      <div className="flex flex-1 items-center justify-center px-6">
         <div className="w-full max-w-[380px]">
           {/* Logo outside the login card */}
-          <div className="mb-3 flex items-center justify-center">
+          <div className="mb-1 flex items-center justify-center">
             <BrandLogo size={200} />
           </div>
 
@@ -214,7 +213,6 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
           </Card>
         </div>
       </div>
-
     </div>
   );
 }
