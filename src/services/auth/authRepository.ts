@@ -18,7 +18,7 @@ import {
 const SESSION_KEY = "nexerp.auth.session.v1";
 
 const DEFAULT_API_BASE_URL =
-  "https://backend-production-ac8a256f.up.railwa.app";
+  "https://backend-production-ac8a256f.up.railway.app";
 
 function getBaseUrl(): string {
   return (
