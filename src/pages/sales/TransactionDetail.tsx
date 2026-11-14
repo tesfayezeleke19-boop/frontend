@@ -364,15 +364,7 @@ export default function TransactionDetail() {
                   : "Edit Draft"}
               </Button>
             )}
-
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5 border-input text-foreground hover:bg-accent"
-            >
-              <Printer className="size-3.5" />
-              Print
-            </Button>
+            
           </div>
         </div>
       </div>
