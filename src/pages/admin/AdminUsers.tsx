@@ -729,21 +729,7 @@ export default function AdminUsers() {
         </CardContent>
       </Card>
 
-      {/* Development information */}
-      <Card className="border-border bg-card shadow-none">
-        <CardContent className="p-4">
-          <div className="flex items-start gap-2.5">
-            <Rocket className="mt-0.5 size-4 shrink-0 text-info" />
-
-            <p className="text-xs leading-5 text-muted-foreground">
-              Account creation and status changes are processed by the
-              authentication backend. New accounts receive the initial
-              password entered by the administrator. Password-reset email
-              delivery requires a separately configured backend reset flow.
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+     
 
       {/* Create / Edit dialog */}
       <Dialog
