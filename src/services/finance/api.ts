@@ -26,7 +26,7 @@ import { authRepository } from "../auth/authRepository";
 
 const API_BASE = (
   (import.meta as any).env?.VITE_API_BASE_URL ||
-  "http://localhost:8080/api"
+  "https://backend-production-ac8a256f.up.railway.app"
 ).replace(/\/+$/, "");
 
 /** Normalize the API root; supports host root or host + /api. */

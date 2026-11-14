@@ -22,7 +22,7 @@ import type {
  */
 
 const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8080"
+  import.meta.env.VITE_API_BASE_URL || "https://backend-production-ac8a256f.up.railway.app"
 ).replace(/\/+$/, "");
 
 const PAYROLL_ENDPOINT = `${API_BASE_URL}/api/hr/payroll`;

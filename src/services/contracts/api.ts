@@ -13,7 +13,7 @@ import type {
 } from "./financials";
 
 const API_BASE = (
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8080"
+  import.meta.env.VITE_API_BASE_URL || "https://backend-production-ac8a256f.up.railway.app"
 ).replace(/\/+$/, "");
 
 const ROOT = `${API_BASE}/api/contracts`;
