@@ -25,11 +25,24 @@ import {
   Wallet,
 } from "lucide-react";
 
+const ETHIOPIAN_MONTHS = [
+  "Meskerem",
+  "Tikimt",
+  "Hidar",
+  "Tahsas",
+  "Tir",
+  "Yekatit",
+  "Megabit",
+  "Miazia",
+  "Ginbot",
+  "Sene",
+  "Hamle",
+  "Nehase",
+  "Pagume",
+];
+
 /**
  * Gets the current Ethiopian calendar year.
- *
- * formatToParts() extracts the year separately instead of converting
- * the complete formatted date string, which can contain locale text.
  */
 function getCurrentEthiopianYear(): number {
   const parts = new Intl.DateTimeFormat(
@@ -108,25 +121,33 @@ function KPICard({
 }
 
 export default function AdminDashboard() {
-  const sales = useAdminSalesOverview();
-  const finance = useAdminFinanceOverview();
-  const hr = useAdminHROverview();
-
-  // Ethiopian calendar year, not Gregorian year.
   const currentEthiopianYear = getCurrentEthiopianYear();
 
   const [year, setYear] = useState<number>(
-    () => getCurrentEthiopianYear(),
+    () => currentEthiopianYear,
   );
 
-  const monthly = useAdminMonthlyFinancials(year);
+  const [month, setMonth] = useState<number | undefined>(
+    undefined,
+  );
+
+  const filters = { year, month };
+
+  const sales = useAdminSalesOverview(filters);
+  const finance = useAdminFinanceOverview(filters);
+  const hr = useAdminHROverview();
+  const monthly = useAdminMonthlyFinancials(year, month);
+
   const monthlyReports = useMonthlyReportOverview();
 
-  // Admin expense workflow (Workflow B) review status — not a payment queue.
+  // Admin expense workflow review status.
   const adminExpenseReview = useAdminExpenseReviewSummary();
 
   const loading =
-    sales.loading || finance.loading || hr.loading;
+    sales.loading ||
+    finance.loading ||
+    hr.loading ||
+    monthly.loading;
 
   if (loading) {
     return (
@@ -140,12 +161,51 @@ export default function AdminDashboard() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h1 className="font-heading text-2xl font-semibold text-foreground">
-          Admin Dashboard
-        </h1>
+      {/* Header and Ethiopian Date Filters */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="font-heading text-2xl font-semibold text-foreground">
+            Admin Dashboard
+          </h1>
+        </div>
 
+        <div className="flex items-center gap-2">
+          <select
+            value={year}
+            onChange={(e) => setYear(Number(e.target.value))}
+            className="h-9 rounded-lg border border-input bg-popover px-3 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-violet/50"
+          >
+            {[0, 1, 2, 3, 4].map((offset) => {
+              const y = currentEthiopianYear - offset;
+
+              return (
+                <option key={y} value={y}>
+                  {y} E.C.
+                </option>
+              );
+            })}
+          </select>
+
+          <select
+            value={month ?? ""}
+            onChange={(e) =>
+              setMonth(
+                e.target.value === ""
+                  ? undefined
+                  : Number(e.target.value),
+              )
+            }
+            className="h-9 min-w-[125px] rounded-lg border border-input bg-popover px-3 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-violet/50"
+          >
+            <option value="">All Months</option>
+
+            {ETHIOPIAN_MONTHS.map((monthName, index) => (
+              <option key={monthName} value={index + 1}>
+                {monthName}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Overall KPI Cards */}
@@ -217,7 +277,7 @@ export default function AdminDashboard() {
         />
       </div>
 
-      {/* Monthly unsold-aggregate reporting + expense payment oversight */}
+      {/* Monthly Inventory Reporting and Admin Expense Oversight */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <KPICard
           label="Latest Submitted Monthly Report"
@@ -272,7 +332,7 @@ export default function AdminDashboard() {
         />
       </div>
 
-      {/* Operational KPIs — monthly reporting + reviews */}
+      {/* Operational KPIs */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
         <KPICard
           label="Latest Reporting Month"
@@ -360,7 +420,9 @@ export default function AdminDashboard() {
           {sales.data && sales.data.byMonth.length > 0 && (
             <div className="mt-6">
               <h4 className="mb-3 font-mono text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground/70">
-                Monthly Sales (Last 6 Months)
+                {month
+                  ? `${ETHIOPIAN_MONTHS[month - 1]} Sales`
+                  : `Monthly Sales (${year} E.C.)`}
               </h4>
 
               <div
@@ -496,7 +558,7 @@ export default function AdminDashboard() {
             />
           </div>
 
-          {/* Financial trend chart */}
+          {/* Financial Summary */}
           {finance.data && (
             <div className="mt-6">
               <h4 className="mb-3 font-mono text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground/70">
@@ -569,26 +631,10 @@ export default function AdminDashboard() {
 
       {/* Monthly Financial Table */}
       <Card className="border-border bg-card shadow-none">
-        <CardHeader className="flex flex-row items-center justify-between pb-3">
+        <CardHeader className="pb-3">
           <CardTitle className="text-sm font-medium text-foreground">
             Monthly Financial Data
           </CardTitle>
-
-          <select
-            value={year}
-            onChange={(e) => setYear(Number(e.target.value))}
-            className="h-8 rounded-lg border border-input bg-popover px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-violet/50"
-          >
-            {[0, 1, 2].map((offset) => {
-              const y = currentEthiopianYear - offset;
-
-              return (
-                <option key={y} value={y}>
-                  {y}
-                </option>
-              );
-            })}
-          </select>
         </CardHeader>
 
         <CardContent className="p-0">
@@ -677,13 +723,25 @@ export default function AdminDashboard() {
                     </td>
                   </tr>
                 ))}
+
+                {!monthly.loading &&
+                  (!monthly.data || monthly.data.length === 0) && (
+                    <tr>
+                      <td
+                        colSpan={7}
+                        className="px-4 py-8 text-center text-muted-foreground"
+                      >
+                        No financial data available for this period.
+                      </td>
+                    </tr>
+                  )}
               </tbody>
             </table>
           </div>
         </CardContent>
       </Card>
 
-      {/* HR Overview */}
+      {/* HR Overview — unchanged by date filters */}
       <Card className="border-border bg-card shadow-none">
         <CardHeader className="pb-3">
           <CardTitle className="text-sm font-medium text-foreground">

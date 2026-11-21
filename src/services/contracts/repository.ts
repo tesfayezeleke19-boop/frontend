@@ -1,24 +1,30 @@
 
 /**
- * API-backed repository — the trusted data layer for standard Contract Orders.
+ * Contracts repository — backend-persisted data layer.
  *
- * All contract and order records are stored by the CodeIgniter backend.
- * No standard contract data is read from or written to localStorage.
+ * All contract and order data is read from and persisted through
+ * the CodeIgniter Contracts API.
  *
- * Frontend permission checks provide immediate feedback. The backend must
- * independently enforce every permission using the authenticated Bearer token.
+ * Contract lifecycle:
+ * DRAFT -> ACTIVE -> COMPLETED
+ *
+ * New contract orders are PENDING until Finance approves them.
+ * Pending orders reserve contract value but do not count as fulfillment.
+ *
+ * No localStorage persistence is used.
  */
+
+import { API_BASE_URL, HR_API_BASE_URL } from "@/lib/api/config";
 import { authRepository } from "../auth/authRepository";
 import { USER_ROLES, type AuthUser } from "../auth/types";
 import { ORDER_STATUS } from "../sales/types";
 import { salesInvoicesRepository } from "../sales/invoiceRepo";
 import { normalizeNumber } from "../sales/calc";
 
-import { contractsApi } from "./api";
-
 import {
   CONTRACT_ORDER_STATUS,
   CONTRACT_STATUS,
+  calculateContractOrderTotals,
   canAcceptOrders,
   validateContractInput,
   validateContractOrderInput,
@@ -32,20 +38,416 @@ import {
 import {
   validatePaymentInformation,
   validateWithholdingInformation,
+  WITHHOLDING_RATE,
   type ContractFinancialInput,
   type ContractFinancialReport,
 } from "./financials";
+
+import type { SalesInvoice } from "../sales/invoice";
+
+/* ------------------------------------------------------------------ */
+/* Backend API                                                         */
+/* ------------------------------------------------------------------ */
+
+const CONTRACT_API_BASE = (API_BASE_URL || HR_API_BASE_URL).replace(/\/+$/, "");
+const CONTRACT_API_ROOT = "/api/contracts";
+
+const contractListeners = new Set<() => void>();
+
+function notifyContractListeners(): void {
+  contractListeners.forEach((listener) => listener());
+}
+
+function getContractAuthToken(): string | null {
+  const session = authRepository.getSession() as any;
+
+  const token =
+    session?.token ||
+    session?.accessToken ||
+    session?.access_token;
+
+  return typeof token === "string" && token.trim()
+    ? token.trim()
+    : null;
+}
+
+async function contractApiRequest<T = any>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  if (!CONTRACT_API_BASE) {
+    throw new Error(
+      "API base URL is missing. Set VITE_API_BASE_URL in the frontend environment.",
+    );
+  }
+
+  const token = getContractAuthToken();
+
+  if (!token) {
+    throw new Error(
+      "Your backend authentication token is missing. Please sign in again.",
+    );
+  }
+
+  const headers = new Headers(options.headers);
+
+  headers.set("Accept", "application/json");
+  headers.set("Authorization", `Bearer ${token}`);
+
+  if (
+    options.body !== undefined &&
+    options.body !== null &&
+    !(options.body instanceof FormData)
+  ) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  let response: Response;
+
+  try {
+    response = await fetch(
+      `${CONTRACT_API_BASE}${CONTRACT_API_ROOT}${path}`,
+      {
+        ...options,
+        headers,
+      },
+    );
+  } catch {
+    throw new Error(
+      "Unable to connect to the Contracts API. Check the backend URL and network connection.",
+    );
+  }
+
+  const responseText = await response.text();
+
+  let payload: any = null;
+
+  if (responseText.trim()) {
+    try {
+      payload = JSON.parse(responseText);
+    } catch {
+      payload = { message: responseText };
+    }
+  }
+
+  if (!response.ok || payload?.success === false) {
+    const message =
+      payload?.messages?.error ??
+      payload?.message ??
+      payload?.error ??
+      payload?.errors ??
+      `Contracts API request failed (${response.status}).`;
+
+    throw new Error(
+      Array.isArray(message)
+        ? message.join(" ")
+        : typeof message === "object"
+          ? JSON.stringify(message)
+          : String(message),
+    );
+  }
+
+  return (payload?.data ?? payload) as T;
+}
+
+async function contractBinaryRequest(
+  path: string,
+): Promise<Blob> {
+  if (!CONTRACT_API_BASE) {
+    throw new Error("Contracts API base URL is missing.");
+  }
+
+  const token = getContractAuthToken();
+
+  if (!token) {
+    throw new Error("Your authentication token is missing.");
+  }
+
+  let response: Response;
+
+  try {
+    response = await fetch(
+      `${CONTRACT_API_BASE}${CONTRACT_API_ROOT}${path}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    );
+  } catch {
+    throw new Error("Unable to download the contract attachment.");
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Unable to retrieve attachment (${response.status}).`,
+    );
+  }
+
+  return response.blob();
+}
+
+function jsonBody(data: unknown): string {
+  return JSON.stringify(data);
+}
+
+function contractDateForApi(
+  value: number | string | undefined,
+): string | null {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("The contract date is invalid.");
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function paymentDateForApi(
+  value: number | string | undefined,
+): string | null {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("The payment date is invalid.");
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function unwrapContractResponse(response: any): Contract {
+  const raw =
+    response?.contract ??
+    response?.data?.contract ??
+    response?.data ??
+    response;
+
+  if (!raw || typeof raw !== "object" || !raw.id) {
+    throw new Error("The backend returned an invalid contract.");
+  }
+
+  return raw as Contract;
+}
+
+function unwrapArray<T>(response: any): T[] {
+  const raw = response?.data ?? response;
+
+  return Array.isArray(raw) ? raw : [];
+}
+
+function firstError(
+  errors: Record<string, string>,
+  fallback: string,
+): string {
+  return Object.values(errors)[0] ?? fallback;
+}
+
+/**
+ * Converts the frontend evidence object into a File.
+ */
+async function evidenceToFile(
+  evidence: any,
+  fallbackName: string,
+): Promise<File | null> {
+  if (!evidence) return null;
+
+  if (typeof File !== "undefined" && evidence instanceof File) {
+    return evidence;
+  }
+
+  if (
+    typeof File !== "undefined" &&
+    evidence.file instanceof File
+  ) {
+    return evidence.file;
+  }
+
+  if (
+    typeof File !== "undefined" &&
+    evidence.rawFile instanceof File
+  ) {
+    return evidence.rawFile;
+  }
+
+  const fileUrl =
+    typeof evidence === "string"
+      ? evidence
+      : evidence.fileUrl || evidence.url || evidence.previewUrl;
+
+  if (
+    typeof fileUrl === "string" &&
+    fileUrl.startsWith("blob:")
+  ) {
+    const response = await fetch(fileUrl);
+
+    if (!response.ok) {
+      throw new Error(`Could not read evidence file: ${fallbackName}`);
+    }
+
+    const blob = await response.blob();
+
+    return new File(
+      [blob],
+      evidence.fileName || evidence.name || fallbackName,
+      {
+        type:
+          evidence.mimeType ||
+          evidence.type ||
+          blob.type ||
+          "application/octet-stream",
+      },
+    );
+  }
+
+  return null;
+}
+
+function appendField(
+  formData: FormData,
+  key: string,
+  value: unknown,
+): void {
+  if (value !== undefined && value !== null) {
+    formData.append(key, String(value));
+  }
+}
+
+async function getContractFromApi(
+  id: string,
+): Promise<Contract | null> {
+  const response = await contractApiRequest<any>(
+    `/${encodeURIComponent(id)}`,
+  );
+
+  return unwrapContractResponse(response);
+}
+
+async function getOrdersFromApi(
+  contractId: string,
+): Promise<ContractOrder[]> {
+  const response = await contractApiRequest<any>(
+    `/${encodeURIComponent(contractId)}/orders`,
+  );
+
+  return unwrapArray<ContractOrder>(response);
+}
+
+async function getAllOrdersFromApi(): Promise<ContractOrder[]> {
+  const response = await contractApiRequest<any>("/all-orders");
+
+  return unwrapArray<ContractOrder>(response);
+}
+
+async function getContractsFromApi(): Promise<Contract[]> {
+  const response = await contractApiRequest<any>("/");
+
+  return unwrapArray<Contract>(response);
+}
+
+async function postAction(
+  path: string,
+  data: unknown = {},
+): Promise<any> {
+  return contractApiRequest(path, {
+    method: "POST",
+    body: jsonBody(data),
+  });
+}
+
+async function putData(
+  path: string,
+  data: unknown,
+): Promise<any> {
+  return contractApiRequest(path, {
+    method: "PUT",
+    body: jsonBody(data),
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Contract progress calculations                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Pending and completed orders both reserve contract value.
+ * Only completed orders contribute to fulfilled contract progress.
+ *
+ * This calculation does not change the contract lifecycle.
+ */
+function calculateProgressFromOrders(
+  contract: Contract,
+  orders: ContractOrder[],
+  backendProgress?: ContractProgress | null,
+): ContractProgress {
+  const contractValue = Math.max(
+    0,
+    normalizeNumber(contract.contractValue),
+  );
+
+  const relevantOrders = orders.filter(
+    (order) =>
+      order.status !== CONTRACT_ORDER_STATUS.CANCELLED,
+  );
+
+  const fulfilledValue = relevantOrders
+    .filter(
+      (order) =>
+        order.status === CONTRACT_ORDER_STATUS.COMPLETED,
+    )
+    .reduce(
+      (sum, order) =>
+        sum + normalizeNumber(order.lineTotalInclVat),
+      0,
+    );
+
+  const reservedValue = relevantOrders
+    .filter(
+      (order) =>
+        order.status === CONTRACT_ORDER_STATUS.PENDING,
+    )
+    .reduce(
+      (sum, order) =>
+        sum + normalizeNumber(order.lineTotalInclVat),
+      0,
+    );
+
+  const committedValue = fulfilledValue + reservedValue;
+
+  const remainingValue = Math.max(
+    0,
+    contractValue - fulfilledValue,
+  );
+
+  const availableValue = Math.max(
+    0,
+    contractValue - committedValue,
+  );
+
+  return {
+    ...(backendProgress ?? {}),
+    contractValue,
+    fulfilledValue,
+    reservedValue,
+    remainingValue,
+    availableValue,
+    overFulfilled: committedValue > contractValue,
+  } as ContractProgress;
+}
 
 /* ------------------------------------------------------------------ */
 /* Errors + authorization                                              */
 /* ------------------------------------------------------------------ */
 
-export class ContractPermissionError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ContractPermissionError";
-  }
-}
+export class ContractPermissionError extends Error {}
 
 interface Caller {
   id: string;
@@ -82,7 +484,10 @@ function sessionCaller(action: string): Caller {
 function requireFinance(action: string): Caller {
   const caller = sessionCaller(action);
 
-  if (caller.role !== USER_ROLES.FINANCE) {
+  if (
+    caller.role !== USER_ROLES.FINANCE &&
+    caller.role !== USER_ROLES.ADMIN
+  ) {
     throw new ContractPermissionError(
       `Only Finance can ${action}.`,
     );
@@ -94,7 +499,10 @@ function requireFinance(action: string): Caller {
 function requireSales(action: string): Caller {
   const caller = sessionCaller(action);
 
-  if (caller.role !== USER_ROLES.SALES) {
+  if (
+    caller.role !== USER_ROLES.SALES &&
+    caller.role !== USER_ROLES.ADMIN
+  ) {
     throw new ContractPermissionError(
       `Only Sales can ${action}.`,
     );
@@ -108,7 +516,8 @@ function requireSalesOrFinance(action: string): Caller {
 
   if (
     caller.role !== USER_ROLES.SALES &&
-    caller.role !== USER_ROLES.FINANCE
+    caller.role !== USER_ROLES.FINANCE &&
+    caller.role !== USER_ROLES.ADMIN
   ) {
     throw new ContractPermissionError(
       `Only Sales or Finance can ${action}.`,
@@ -122,215 +531,81 @@ function actorLabel(caller: Caller): string {
   return caller.email || caller.name;
 }
 
-function firstError(
-  errors: Record<string, string>,
-  fallback: string,
-): string {
-  return Object.values(errors)[0] ?? fallback;
-}
-
 /* ------------------------------------------------------------------ */
-/* Repository change notifications                                    */
+/* Financial helpers                                                   */
 /* ------------------------------------------------------------------ */
 
-const listeners = new Set<() => void>();
+function validateFinancialInput(
+  input: ContractFinancialInput,
+): void {
+  if (input.payment && input.payment !== null) {
+    const validation = validatePaymentInformation(input.payment);
 
-function notifyContractsChanged(): void {
-  for (const listener of listeners) {
-    try {
-      listener();
-    } catch (error) {
-      console.error(
-        "Contract refresh listener failed:",
-        error,
+    if (!validation.valid) {
+      throw new Error(
+        firstError(
+          validation.errors,
+          "Payment information is incomplete.",
+        ),
+      );
+    }
+  }
+
+  if (input.withholding) {
+    const validation = validateWithholdingInformation({
+      enabled: input.withholding.enabled,
+      evidence: input.withholding.evidence,
+    });
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(
+          validation.errors,
+          "Withholding information is incomplete.",
+        ),
       );
     }
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Internal helpers                                                    */
-/* ------------------------------------------------------------------ */
-
-function validateContract(input: ContractInput): void {
-  const validation = validateContractInput(input);
-
-  if (!validation.valid) {
-    throw new Error(
-      firstError(
-        validation.errors,
-        "Contract information is incomplete.",
-      ),
-    );
-  }
-}
-
-function validateOrder(input: ContractOrderInput): void {
-  const validation = validateContractOrderInput(input);
-
-  if (!validation.valid) {
-    throw new Error(
-      firstError(
-        validation.errors,
-        "Contract order information is incomplete.",
-      ),
-    );
-  }
-}
-
-function sortContracts(contracts: Contract[]): Contract[] {
-  return [...contracts].sort(
-    (a, b) => b.createdAt - a.createdAt,
-  );
-}
-
-function sortOrders(orders: ContractOrder[]): ContractOrder[] {
-  return [...orders].sort(
-    (a, b) => a.orderNumber - b.orderNumber,
-  );
-}
-
-/**
- * Converts the backend progress response into the exact ContractProgress
- * interface defined in types.ts.
- *
- * Supports both camelCase and snake_case API response properties.
- */
-function normalizeProgress(raw: unknown): ContractProgress {
-  const data =
-    raw && typeof raw === "object"
-      ? (raw as Record<string, unknown>)
-      : {};
-
-  const readNumber = (
-    ...values: unknown[]
-  ): number => {
-    for (const value of values) {
-      if (value !== undefined && value !== null && value !== "") {
-        const parsed = Number(value);
-
-        if (Number.isFinite(parsed)) {
-          return parsed;
-        }
-      }
-    }
-
-    return 0;
-  };
-
-  const readBoolean = (
-    value: unknown,
-    fallback: boolean,
-  ): boolean => {
-    if (typeof value === "boolean") return value;
-    if (typeof value === "number") return value !== 0;
-
-    if (typeof value === "string") {
-      const normalized = value.trim().toLowerCase();
-
-      if (["true", "1", "yes"].includes(normalized)) {
-        return true;
-      }
-
-      if (["false", "0", "no"].includes(normalized)) {
-        return false;
-      }
-    }
-
-    return fallback;
-  };
-
-  const contractValue = Math.max(
-    0,
-    readNumber(
-      data.contractValue,
-      data.contract_value,
-    ),
-  );
-
-  const fulfilledValue = Math.max(
-    0,
-    readNumber(
-      data.fulfilledValue,
-      data.fulfilled_value,
-    ),
-  );
-
-  const remainingValue = Math.max(
-    0,
-    readNumber(
-      data.remainingValue,
-      data.remaining_value,
-      contractValue - fulfilledValue,
-    ),
-  );
-
-  const rawFulfillmentPercent = readNumber(
-    data.rawFulfillmentPercent,
-    data.raw_fulfillment_percent,
-    data.fulfillmentPercent,
-    data.fulfillment_percent,
-    data.fulfillment_percentage,
-    contractValue > 0
-      ? (fulfilledValue / contractValue) * 100
-      : 0,
-  );
-
-  const fulfillmentPercent = Math.max(
-    0,
-    Math.min(
-      100,
-      readNumber(
-        data.fulfillmentPercent,
-        data.fulfillment_percent,
-        data.fulfillment_percentage,
-        rawFulfillmentPercent,
-      ),
-    ),
-  );
-
+function financialPayload(
+  input: ContractFinancialInput,
+): Record<string, unknown> {
   return {
-    contractValue,
-    fulfilledValue,
-    remainingValue,
-
-    overFulfilled: readBoolean(
-      data.overFulfilled ?? data.over_fulfilled,
-      fulfilledValue > contractValue,
-    ),
-
-    orderCount: Math.max(
-      0,
-      readNumber(
-        data.orderCount,
-        data.order_count,
-        data.totalOrders,
-        data.total_orders,
-      ),
-    ),
-
-    completedOrderCount: Math.max(
-      0,
-      readNumber(
-        data.completedOrderCount,
-        data.completed_order_count,
-        data.completedOrders,
-        data.completed_orders,
-      ),
-    ),
-
-    fulfillmentPercent,
-    rawFulfillmentPercent,
-
-    reachedValue: readBoolean(
-      data.reachedValue ?? data.reached_value,
-      contractValue > 0 && fulfilledValue >= contractValue,
-    ),
+    ...(input.payment === undefined
+      ? {}
+      : {
+          payment:
+            input.payment === null
+              ? null
+              : {
+                  bank: input.payment.bank.trim(),
+                  paymentSender: input.payment.paymentSender.trim(),
+                  paymentAmount: Math.max(
+                    0,
+                    normalizeNumber(input.payment.paymentAmount),
+                  ),
+                  paymentDate: paymentDateForApi(
+                    input.payment.paymentDate,
+                  ),
+                  paymentReferenceNumber:
+                    input.payment.paymentReferenceNumber.trim(),
+                  paymentEvidence: input.payment.paymentEvidence,
+                  remark: input.payment.remark?.trim() || "",
+                },
+        }),
+    withholding: input.withholding
+      ? {
+          enabled: input.withholding.enabled,
+          rate: input.withholding.enabled
+            ? WITHHOLDING_RATE
+            : 0,
+          evidence: input.withholding.enabled
+            ? input.withholding.evidence
+            : null,
+        }
+      : undefined,
   };
-}
-
-function isCompletedOrder(order: ContractOrder): boolean {
-  return order.status === CONTRACT_ORDER_STATUS.COMPLETED;
 }
 
 /* ------------------------------------------------------------------ */
@@ -343,46 +618,23 @@ export interface ContractsRepository {
   getContractOrders(contractId: string): Promise<ContractOrder[]>;
   getAllOrders(): Promise<ContractOrder[]>;
   getOrderById(id: string): Promise<ContractOrder | null>;
-
-  getContractProgress(
-    contractId: string,
-  ): Promise<ContractProgress | null>;
-
-  getFinancialReport(
-    id: string,
-  ): Promise<ContractFinancialReport | null>;
+  getContractProgress(contractId: string): Promise<ContractProgress | null>;
+  getFinancialReport(id: string): Promise<ContractFinancialReport | null>;
 
   saveFinancialInformation(
     id: string,
     input: ContractFinancialInput,
   ): Promise<Contract>;
 
-  createContract(
-    input: ContractInput,
-    actor?: string,
-  ): Promise<Contract>;
-
-  updateContract(
-    id: string,
-    input: ContractInput,
-  ): Promise<Contract>;
-
-  activateContract(
-    id: string,
-    actor?: string,
-  ): Promise<Contract>;
+  createContract(input: ContractInput, actor?: string): Promise<Contract>;
+  updateContract(id: string, input: ContractInput): Promise<Contract>;
+  activateContract(id: string, actor?: string): Promise<Contract>;
 
   requestCompletion(id: string): Promise<Contract>;
 
   confirmCompletion(
     id: string,
     reason: string | undefined,
-    actor?: string,
-  ): Promise<Contract>;
-
-  cancelContract(
-    id: string,
-    reason: string,
     actor?: string,
   ): Promise<Contract>;
 
@@ -401,6 +653,8 @@ export interface ContractsRepository {
     actor?: string,
   ): Promise<ContractOrder>;
 
+  approveOrder(orderId: string, actor?: string): Promise<ContractOrder>;
+
   updateOrder(
     orderId: string,
     input: ContractOrderInput,
@@ -417,56 +671,42 @@ export interface ContractsRepository {
 }
 
 /* ------------------------------------------------------------------ */
-/* API repository                                                      */
+/* Implementation                                                      */
 /* ------------------------------------------------------------------ */
 
-export class ApiContractsRepository implements ContractsRepository {
-  /* ---------------------------------------------------------------- */
-  /* Reads                                                             */
-  /* ---------------------------------------------------------------- */
+export class LocalContractsRepository implements ContractsRepository {
+  /* -------------------------------------------------------------- */
+  /* Read operations                                                 */
+  /* -------------------------------------------------------------- */
 
   async getContracts(): Promise<Contract[]> {
-    const contracts = await contractsApi.getContracts();
+    const contracts = await getContractsFromApi();
 
-    return sortContracts(contracts);
+    return contracts.sort(
+      (a, b) => b.createdAt - a.createdAt,
+    );
   }
 
   async getContractById(id: string): Promise<Contract | null> {
-    try {
-      return await contractsApi.getContract(id);
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        (/\b404\b/i.test(error.message) ||
-          /not found/i.test(error.message))
-      ) {
-        return null;
-      }
-
-      throw error;
-    }
+    return getContractFromApi(id);
   }
 
   async getContractOrders(
     contractId: string,
   ): Promise<ContractOrder[]> {
-    const orders = await contractsApi.getOrders(contractId);
+    const orders = await getOrdersFromApi(contractId);
 
-    return sortOrders(orders);
-  }
-
-  async getAllOrders(): Promise<ContractOrder[]> {
-    const orders = await contractsApi.getAllOrders();
-
-    return [...orders].sort(
-      (a, b) =>
-        b.createdAt - a.createdAt ||
-        a.orderNumber - b.orderNumber,
+    return orders.sort(
+      (a, b) => a.orderNumber - b.orderNumber,
     );
   }
 
+  async getAllOrders(): Promise<ContractOrder[]> {
+    return getAllOrdersFromApi();
+  }
+
   async getOrderById(id: string): Promise<ContractOrder | null> {
-    const orders = await contractsApi.getAllOrders();
+    const orders = await getAllOrdersFromApi();
 
     return orders.find((order) => order.id === id) ?? null;
   }
@@ -474,28 +714,65 @@ export class ApiContractsRepository implements ContractsRepository {
   async getContractProgress(
     contractId: string,
   ): Promise<ContractProgress | null> {
-    const contract = await this.getContractById(contractId);
+    const contract = await getContractFromApi(contractId);
 
     if (!contract) return null;
 
-    const progress = await contractsApi.getProgress(contractId);
+    const [backendProgress, orders] = await Promise.all([
+      contractApiRequest<ContractProgress>(
+        `/${encodeURIComponent(contractId)}/progress`,
+      ),
+      getOrdersFromApi(contractId),
+    ]);
 
-    return normalizeProgress(progress);
+    return calculateProgressFromOrders(
+      contract,
+      orders,
+      backendProgress,
+    );
   }
 
   async getFinancialReport(
     id: string,
   ): Promise<ContractFinancialReport | null> {
-    const contract = await this.getContractById(id);
+    const contract = await getContractFromApi(id);
 
     if (!contract) return null;
 
-    return contractsApi.getFinancialReport(id);
+    const report = await contractApiRequest<any>(
+      `/${encodeURIComponent(id)}/financial-report`,
+    );
+
+    let invoice: SalesInvoice | null = null;
+    let invoiceError: string | undefined;
+
+    try {
+      const invoices = await salesInvoicesRepository.getInvoices();
+
+      invoice =
+        invoices.find((item) => item.contractId === id) ?? null;
+
+      if (!invoice && contract.status === CONTRACT_STATUS.COMPLETED) {
+        invoiceError =
+          "No Sales Invoice has been created for this completed contract yet.";
+      }
+    } catch (error) {
+      invoiceError =
+        error instanceof Error
+          ? error.message
+          : "The Sales Invoice for this contract could not be loaded.";
+    }
+
+    return {
+      ...report,
+      invoice: invoice ?? report.invoice ?? null,
+      invoiceError: invoiceError ?? report.invoiceError,
+    } as ContractFinancialReport;
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Finance — financial information                                   */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Finance — financial information                                 */
+  /* -------------------------------------------------------------- */
 
   async saveFinancialInformation(
     id: string,
@@ -505,100 +782,200 @@ export class ApiContractsRepository implements ContractsRepository {
       "record contract payment and withholding information",
     );
 
-    const current = await this.getContractById(id);
+    const current = await getContractFromApi(id);
 
     if (!current) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
     }
 
-    if (current.status === CONTRACT_STATUS.CANCELLED) {
-      throw new Error(
-        "A cancelled contract cannot take payment or withholding updates.",
-      );
-    }
+    validateFinancialInput(input);
 
-    const payment =
-      input.payment === null
-        ? null
-        : input.payment
-          ? {
-              ...input.payment,
-              paymentEvidence:
-                input.payment.paymentEvidence ??
-                current.payment?.paymentEvidence,
-            }
-          : undefined;
+    const payload = financialPayload(input);
 
-    const withholdingEvidence = input.withholding.enabled
-      ? input.withholding.evidence ??
-        current.withholding?.evidence
-      : input.withholding.evidence;
-
-    const withholdingValidation =
-      validateWithholdingInformation({
-        enabled: input.withholding.enabled,
-        evidence: withholdingEvidence,
-      });
-
-    if (!withholdingValidation.valid) {
-      throw new Error(
-        firstError(
-          withholdingValidation.errors,
-          "Withholding information is incomplete.",
-        ),
-      );
-    }
-
-    if (payment) {
-      const paymentValidation =
-        validatePaymentInformation(payment);
-
-      if (!paymentValidation.valid) {
-        throw new Error(
-          firstError(
-            paymentValidation.errors,
-            "Payment information is incomplete.",
-          ),
-        );
-      }
-    }
-
-    const updated = await contractsApi.saveFinancialInformation(
-      id,
-      {
-        payment,
-        withholding: {
-          enabled: input.withholding.enabled,
-          evidence: withholdingEvidence,
-        },
-      },
+    await putData(
+      `/${encodeURIComponent(id)}/financial-information`,
+      payload,
     );
 
-    notifyContractsChanged();
+    const updated = await getContractFromApi(id);
+
+    if (!updated) {
+      throw new Error(
+        "Financial information was saved, but the contract could not be reloaded.",
+      );
+    }
+
+    notifyContractListeners();
 
     return updated;
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Finance — contract lifecycle                                      */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Finance — create contract                                       */
+  /* -------------------------------------------------------------- */
 
   async createContract(
     input: ContractInput,
     actor?: string,
   ): Promise<Contract> {
-    requireFinance("create contracts");
+    const caller = requireFinance("create contracts");
 
-    validateContract(input);
+    const validation = validateContractInput(input);
 
-    const created = await contractsApi.createContract(input);
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Contract is incomplete."),
+      );
+    }
+
+    const payment = input.payment;
+
+    if (!payment) {
+      throw new Error("The initial payment information is required.");
+    }
+
+    const contractValue = normalizeNumber(input.contractValue);
+    const paymentAmount = normalizeNumber(payment.paymentAmount);
+
+    if (paymentAmount < contractValue) {
+      throw new Error(
+        "The initial payment amount cannot be less than the contract value.",
+      );
+    }
+
+    const paymentFile = await evidenceToFile(
+      payment.paymentEvidence,
+      "payment-evidence",
+    );
+
+    const withholdingFile = await evidenceToFile(
+      input.withholding?.evidence,
+      "withholding-evidence",
+    );
+
+    if (input.withholding?.enabled && !withholdingFile) {
+      throw new Error(
+        "Withholding evidence is required when withholding is enabled.",
+      );
+    }
+
+    const attachmentInput: any = input.attachments;
+
+    const contractAttachment = Array.isArray(attachmentInput)
+      ? attachmentInput[0]
+      : attachmentInput;
+
+    const contractFile = await evidenceToFile(
+      contractAttachment,
+      "contract-attachment",
+    );
+
+    const formData = new FormData();
+
+    appendField(
+      formData,
+      "customerName",
+      input.customerName.trim(),
+    );
+
+    appendField(
+      formData,
+      "customerTin",
+      input.tin.trim(),
+    );
+
+    appendField(
+      formData,
+      "fsNo",
+      input.fsNo.trim(),
+    );
+
+    appendField(
+      formData,
+      "contractValue",
+      contractValue,
+    );
+
+    appendField(
+      formData,
+      "contractDate",
+      contractDateForApi(input.contractDate),
+    );
+
+    appendField(
+      formData,
+      "remark",
+      input.remark?.trim() || "",
+    );
+
+    formData.append(
+      "payment",
+      JSON.stringify({
+        bank: payment.bank.trim(),
+        paymentSender: payment.paymentSender.trim(),
+        paymentAmount,
+        paymentDate: paymentDateForApi(payment.paymentDate),
+        paymentReferenceNumber:
+          payment.paymentReferenceNumber.trim(),
+        remark: payment.remark?.trim() || "",
+      }),
+    );
+
+    formData.append(
+      "withholding",
+      JSON.stringify({
+        enabled: input.withholding?.enabled ?? false,
+        rate: input.withholding?.enabled
+          ? WITHHOLDING_RATE
+          : 0,
+      }),
+    );
+
+    if (contractFile) {
+      formData.append(
+        "contractAttachment",
+        contractFile,
+        contractFile.name,
+      );
+    }
+
+    if (paymentFile) {
+      formData.append(
+        "paymentAttachment",
+        paymentFile,
+        paymentFile.name,
+      );
+    }
+
+    if (withholdingFile) {
+      formData.append(
+        "withholdingAttachment",
+        withholdingFile,
+        withholdingFile.name,
+      );
+    }
+
+    const response = await contractApiRequest<any>(
+      "/",
+      {
+        method: "POST",
+        body: formData,
+      },
+    );
+
+    const created = unwrapContractResponse(response);
+
+    notifyContractListeners();
 
     void actor;
-
-    notifyContractsChanged();
+    void caller;
 
     return created;
   }
+
+  /* -------------------------------------------------------------- */
+  /* Finance — update contract                                       */
+  /* -------------------------------------------------------------- */
 
   async updateContract(
     id: string,
@@ -606,73 +983,118 @@ export class ApiContractsRepository implements ContractsRepository {
   ): Promise<Contract> {
     requireFinance("edit contracts");
 
-    validateContract(input);
-
-    const current = await this.getContractById(id);
+    const current = await getContractFromApi(id);
 
     if (!current) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
+    }
+
+    const validation = validateContractInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Contract is incomplete."),
+      );
     }
 
     if (current.status !== CONTRACT_STATUS.DRAFT) {
       throw new Error(
-        "Only a Draft contract can be edited. An activated contract keeps its customer, FS No, value, date, and attachments.",
+        "Only draft contracts can be edited.",
       );
     }
 
-    const updated = await contractsApi.updateContract(id, input);
+    await putData(
+      `/${encodeURIComponent(id)}`,
+      {
+        customerName: input.customerName.trim(),
+        customerTin: input.tin.trim(),
+        fsNo: input.fsNo.trim(),
+        contractValue: normalizeNumber(input.contractValue),
+        contractDate: contractDateForApi(input.contractDate),
+        remark: input.remark?.trim() || "",
+      },
+    );
 
-    notifyContractsChanged();
+    const updated = await getContractFromApi(id);
+
+    if (!updated) {
+      throw new Error("The updated contract could not be reloaded.");
+    }
+
+    notifyContractListeners();
 
     return updated;
   }
+
+  /* -------------------------------------------------------------- */
+  /* Finance — activate contract                                     */
+  /* -------------------------------------------------------------- */
 
   async activateContract(
     id: string,
     actor?: string,
   ): Promise<Contract> {
-    requireFinance("activate contracts");
+    const caller = requireFinance("activate contracts");
 
-    const current = await this.getContractById(id);
+    const current = await getContractFromApi(id);
 
     if (!current) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
     }
 
     if (current.status !== CONTRACT_STATUS.DRAFT) {
       throw new Error("Only a Draft contract can be activated.");
     }
 
-    const updated = await contractsApi.activateContract(id);
+    await postAction(
+      `/${encodeURIComponent(id)}/activate`,
+    );
+
+    const updated = await getContractFromApi(id);
+
+    if (!updated) {
+      throw new Error("The activated contract could not be reloaded.");
+    }
+
+    notifyContractListeners();
 
     void actor;
-
-    notifyContractsChanged();
+    void caller;
 
     return updated;
   }
+
+  /* -------------------------------------------------------------- */
+  /* Finance — completion review                                     */
+  /* -------------------------------------------------------------- */
 
   async requestCompletion(id: string): Promise<Contract> {
     requireFinance("request contract completion review");
 
-    const current = await this.getContractById(id);
+    const current = await getContractFromApi(id);
 
     if (!current) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
     }
 
-    if (current.status !== CONTRACT_STATUS.IN_PROGRESS) {
+    if (current.status !== CONTRACT_STATUS.ACTIVE) {
       throw new Error(
-        "Only an In Progress contract can be flagged for completion review.",
+        "Only an active contract can be submitted for completion review.",
       );
     }
 
-    const updated = await contractsApi.requestCompletion(id);
-
-    notifyContractsChanged();
-
-    return updated;
+    /*
+     * The current contract lifecycle does not have a separate
+     * READY_FOR_COMPLETION status. Finance confirms completion directly.
+     */
+    throw new Error(
+      "A separate completion-review status is no longer used. Use Confirm Completion to complete this active contract.",
+    );
   }
+
+  /* -------------------------------------------------------------- */
+  /* Finance — confirm completion                                    */
+  /* -------------------------------------------------------------- */
 
   async confirmCompletion(
     id: string,
@@ -681,90 +1103,58 @@ export class ApiContractsRepository implements ContractsRepository {
   ): Promise<Contract> {
     requireFinance("confirm contract completion");
 
-    const current = await this.getContractById(id);
+    const current = await getContractFromApi(id);
 
     if (!current) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
     }
 
-    if (
-      current.status !== CONTRACT_STATUS.IN_PROGRESS &&
-      current.status !== CONTRACT_STATUS.READY_FOR_COMPLETION
-    ) {
+    if (current.status !== CONTRACT_STATUS.ACTIVE) {
       throw new Error(
         "Only an active contract can be confirmed as completed.",
       );
     }
 
-    const progress = await contractsApi.getProgress(id);
-    const normalizedProgress = normalizeProgress(progress);
+    const progress = await this.getContractProgress(id);
+
+    if (!progress) {
+      throw new Error("Contract progress could not be loaded.");
+    }
 
     const belowValue =
-      normalizedProgress.fulfilledValue <
-      normalizedProgress.contractValue;
+      progress.fulfilledValue < progress.contractValue;
 
-    if (belowValue && !reason?.trim()) {
+    const reasonText = reason?.trim() ?? "";
+
+    if (belowValue && !reasonText) {
       throw new Error(
         "Closing a contract below its contract value requires a recorded reason.",
       );
     }
 
-    const updated = await contractsApi.confirmCompletion(
-      id,
-      reason?.trim() || undefined,
+    await postAction(
+      `/${encodeURIComponent(id)}/confirm-completion`,
+      {
+        reason: reasonText,
+      },
     );
 
-    void actor;
+    const updated = await getContractFromApi(id);
 
-    notifyContractsChanged();
+    if (!updated) {
+      throw new Error("The contract could not be reloaded.");
+    }
+
+    notifyContractListeners();
+
+    void actor;
 
     return updated;
   }
 
-  async cancelContract(
-    id: string,
-    reason: string,
-    actor?: string,
-  ): Promise<Contract> {
-    requireFinance("cancel contracts");
-
-    const reasonText = reason?.trim();
-
-    if (!reasonText) {
-      throw new Error("A cancellation reason is required.");
-    }
-
-    const current = await this.getContractById(id);
-
-    if (!current) {
-      throw new Error("Contract not found.");
-    }
-
-    if (current.status === CONTRACT_STATUS.CONVERTED) {
-      throw new Error(
-        "A converted contract has a Sales Invoice and cannot be cancelled.",
-      );
-    }
-
-    if (current.status === CONTRACT_STATUS.CANCELLED) {
-      throw new Error("This contract is already cancelled.");
-    }
-
-    const updated = await contractsApi.cancelContract(
-      id,
-      reasonText,
-    );
-
-    void actor;
-
-    notifyContractsChanged();
-
-    return updated;
-  }
-
-  /* ---------------------------------------------------------------- */
-  /* Finance — conversion into the existing Sales Invoice              */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Finance — convert completed contract into Sales Invoice        */
+  /* -------------------------------------------------------------- */
 
   async convertContractToInvoice(
     id: string,
@@ -775,78 +1165,59 @@ export class ApiContractsRepository implements ContractsRepository {
     invoiceNumber: string;
   }> {
     const caller = requireFinance(
-      "convert contracts into Sales Invoices",
+      "convert completed contracts into Sales Invoices",
     );
 
-    const current = await this.getContractById(id);
+    const current = await getContractFromApi(id);
 
     if (!current) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
     }
 
-    if (
-      current.status === CONTRACT_STATUS.CONVERTED &&
-      current.salesInvoiceId
-    ) {
-      const existing =
-        await salesInvoicesRepository.getInvoiceById(
-          current.salesInvoiceId,
-        );
-
-      if (existing) {
-        return {
-          contract: current,
-          invoiceId: existing.id,
-          invoiceNumber: existing.invoiceNumber,
-        };
-      }
-    }
-
-    if (current.status === CONTRACT_STATUS.CANCELLED) {
-      throw new Error(
-        "A cancelled contract cannot be converted.",
-      );
-    }
-
-    if (!current.completionConfirmedAt) {
+    if (current.status !== CONTRACT_STATUS.COMPLETED) {
       throw new Error(
         "Finance must confirm contract completion before converting it into a Sales Invoice.",
       );
     }
 
-    const orders = (await contractsApi.getOrders(id))
-      .filter(isCompletedOrder)
-      .sort((a, b) => a.orderNumber - b.orderNumber);
-
-    if (orders.length === 0) {
+    if (!current.completionConfirmedAt) {
       throw new Error(
-        "This contract has no completed orders — there is nothing to invoice.",
+        "Contract completion must be confirmed before conversion.",
       );
     }
 
-    const existingInvoices =
-      await salesInvoicesRepository.getInvoices();
+    const existingInvoices = await salesInvoicesRepository.getInvoices();
 
-    const adopted = existingInvoices.find(
+    const existingInvoice = existingInvoices.find(
       (invoice) => invoice.contractId === id,
     );
 
-    if (adopted) {
-      const linked = await contractsApi.markConverted(
-        id,
-        adopted.id,
-      );
-
-      notifyContractsChanged();
-
+    if (existingInvoice) {
       return {
-        contract: linked,
-        invoiceId: adopted.id,
-        invoiceNumber: adopted.invoiceNumber,
+        contract: current,
+        invoiceId: existingInvoice.id,
+        invoiceNumber: existingInvoice.invoiceNumber,
       };
     }
 
-    await contractsApi.startConversion(id);
+    await postAction(
+      `/${encodeURIComponent(id)}/conversion/start`,
+    );
+
+    const allOrders = await getOrdersFromApi(id);
+
+    const approvedOrders = allOrders
+      .filter(
+        (order) =>
+          order.status === CONTRACT_ORDER_STATUS.COMPLETED,
+      )
+      .sort((a, b) => a.orderNumber - b.orderNumber);
+
+    if (!approvedOrders.length) {
+      throw new Error(
+        "This contract has no approved orders to invoice.",
+      );
+    }
 
     try {
       const invoice = await salesInvoicesRepository.createInvoice(
@@ -857,7 +1228,7 @@ export class ApiContractsRepository implements ContractsRepository {
           },
           fsNo: current.fsNo,
           contractId: current.id,
-          orders: orders.map((order) => ({
+          orders: approvedOrders.map((order) => ({
             aggregate: order.aggregate,
             quantity: order.quantity,
             unitPrice: order.unitPrice,
@@ -865,22 +1236,19 @@ export class ApiContractsRepository implements ContractsRepository {
             contractOrderId: order.id,
             orderDate: order.orderDate,
           })),
-          withholdingEnabled:
-            current.withholding?.enabled ?? false,
-          withholdingEvidence:
-            current.withholding?.enabled
-              ? current.withholding.evidence
-              : undefined,
+          withholdingEnabled: current.withholding?.enabled ?? false,
+          withholdingEvidence: current.withholding?.enabled
+            ? current.withholding.evidence
+            : undefined,
           payment: {
             bank: current.payment?.bank ?? "",
-            paymentSender:
-              current.payment?.paymentSender ?? "",
+            paymentSender: current.payment?.paymentSender ?? "",
             paymentReferenceNumber:
               current.payment?.paymentReferenceNumber ?? "",
-            paymentEvidence:
-              current.payment?.paymentEvidence,
+            paymentEvidence: current.payment?.paymentEvidence,
           },
-          remark: `Converted from Contract ${current.contractNumber} (${orders.length} orders). Payment details are completed before approval.`,
+          remark:
+            `Converted from Contract ${current.contractNumber} (${approvedOrders.length} approved orders).`,
         },
         {
           status: ORDER_STATUS.PENDING_FINANCE_REVIEW,
@@ -888,143 +1256,290 @@ export class ApiContractsRepository implements ContractsRepository {
         },
       );
 
-      const converted = await contractsApi.markConverted(
-        id,
-        invoice.id,
+      await postAction(
+        `/${encodeURIComponent(id)}/conversion/complete`,
+        {
+          salesInvoiceId: invoice.id,
+        },
       );
 
-      notifyContractsChanged();
+      const updatedContract = await getContractFromApi(id);
+
+      if (!updatedContract) {
+        throw new Error(
+          "The invoice was created, but the contract could not be reloaded.",
+        );
+      }
+
+      notifyContractListeners();
 
       return {
-        contract: converted,
+        contract: updatedContract,
         invoiceId: invoice.id,
         invoiceNumber: invoice.invoiceNumber,
       };
     } catch (error) {
-      try {
-        await contractsApi.markConversionFailed(
-          id,
-          error instanceof Error
-            ? error.message
-            : String(error),
-        );
-      } catch (failureError) {
-        console.error(
-          "Could not record contract conversion failure:",
-          failureError,
-        );
-      }
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
 
-      notifyContractsChanged();
+      try {
+        await postAction(
+          `/${encodeURIComponent(id)}/conversion/failed`,
+          { message },
+        );
+      } catch {
+        // Preserve the original conversion error.
+      }
 
       throw error;
     }
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Sales — individual orders                                         */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Sales — create contract order                                    */
+  /* -------------------------------------------------------------- */
 
   async completeOrder(
     contractId: string,
     input: ContractOrderInput,
     actor?: string,
   ): Promise<ContractOrder> {
-    requireSales("complete contract orders");
+    requireSales("create contract orders");
 
-    validateOrder(input);
-
-    const contract = await this.getContractById(contractId);
+    const contract = await getContractFromApi(contractId);
 
     if (!contract) {
-      throw new Error("Contract not found.");
+      throw new Error("Contract not found");
     }
 
     if (!canAcceptOrders(contract.status)) {
       throw new Error(
-        "This contract is not accepting orders — it is cancelled or already converted.",
+        "This contract is not accepting orders. It may already be completed.",
       );
     }
 
-    const created = await contractsApi.createOrder(
-      contractId,
+    if (normalizeNumber(contract.contractValue) <= 0) {
+      throw new Error(
+        `${contract.contractNumber} has no valid contract value. Finance must correct it first.`,
+      );
+    }
+
+    const validation = validateContractOrderInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Order is incomplete."),
+      );
+    }
+
+    const totals = calculateContractOrderTotals(input);
+
+    const progress = await this.getContractProgress(contractId);
+
+    if (!progress) {
+      throw new Error("Contract progress could not be loaded.");
+    }
+
+    const availableValue = Math.max(
+      0,
+      normalizeNumber(progress.availableValue),
+    );
+
+    if (totals.lineTotalInclVat > availableValue) {
+      throw new Error(
+        `This order exceeds the available contract value. Available: ${availableValue.toLocaleString()}; requested: ${totals.lineTotalInclVat.toLocaleString()}.`,
+      );
+    }
+
+    /*
+     * The backend creates new orders as PENDING.
+     * They reserve contract value until Finance approves them.
+     */
+    const response = await postAction(
+      `/${encodeURIComponent(contractId)}/orders`,
       {
-        ...input,
+        aggregate: input.aggregate,
         quantity: normalizeNumber(input.quantity),
-        unitPrice: normalizeNumber(input.unitPrice),
-        royaltyInvoiceNumber:
-          input.royaltyInvoiceNumber.trim(),
+        royaltyInvoiceNumber: input.royaltyInvoiceNumber.trim(),
+        orderDate: contractDateForApi(input.orderDate),
       },
     );
 
+    const order = response as ContractOrder;
+
+    notifyContractListeners();
+
     void actor;
 
-    notifyContractsChanged();
-
-    return created;
+    return order;
   }
+
+  /* -------------------------------------------------------------- */
+  /* Finance — approve order                                          */
+  /* -------------------------------------------------------------- */
+
+  async approveOrder(
+    orderId: string,
+    actor?: string,
+  ): Promise<ContractOrder> {
+    requireFinance("approve contract orders");
+
+    const order = await this.getOrderById(orderId);
+
+    if (!order) {
+      throw new Error("Contract order not found.");
+    }
+
+    if (order.status === CONTRACT_ORDER_STATUS.COMPLETED) {
+      return order;
+    }
+
+    if (order.status !== CONTRACT_ORDER_STATUS.PENDING) {
+      throw new Error(
+        "Only pending contract orders can be approved.",
+      );
+    }
+
+    /*
+     * The backend controller supplied earlier does not yet contain
+     * a separate order-approval endpoint. Do not mark an order approved
+     * locally or change its status without backend confirmation.
+     */
+    throw new Error(
+      "The backend does not yet provide a contract-order approval endpoint.",
+    );
+  }
+
+  /* -------------------------------------------------------------- */
+  /* Sales / Finance — update order                                   */
+  /* -------------------------------------------------------------- */
 
   async updateOrder(
     orderId: string,
     input: ContractOrderInput,
     actor?: string,
   ): Promise<ContractOrder> {
-    const caller = requireSalesOrFinance(
-      "correct contract orders",
-    );
+    const caller = requireSalesOrFinance("correct contract orders");
 
-    validateOrder(input);
+    const order = await this.getOrderById(orderId);
 
-    const current = await this.getOrderById(orderId);
-
-    if (!current) {
+    if (!order) {
       throw new Error("Contract order not found.");
     }
 
-    const contract = await this.getContractById(
-      current.contractId,
-    );
+    const contract = await getContractFromApi(order.contractId);
 
     if (!contract) {
       throw new Error("Contract not found.");
     }
 
-    if (contract.status === CONTRACT_STATUS.CONVERTED) {
+    if (contract.status === CONTRACT_STATUS.COMPLETED) {
       throw new Error(
-        "This contract has been converted into a Sales Invoice and its orders are frozen.",
+        "Orders belonging to a completed contract cannot be edited.",
       );
     }
 
-    if (current.status === CONTRACT_ORDER_STATUS.CANCELLED) {
+    if (order.status === CONTRACT_ORDER_STATUS.CANCELLED) {
       throw new Error("A cancelled order cannot be edited.");
     }
 
     if (
       caller.role === USER_ROLES.SALES &&
-      current.completedByUserId !== caller.id
+      order.completedByUserId !== caller.id &&
+      order.createdByUserId !== caller.id
     ) {
       throw new ContractPermissionError(
-        "Only the salesperson who completed this order — or Finance — can correct it.",
+        "Only the salesperson who created this order — or Finance — can correct it.",
       );
     }
 
-    const updated = await contractsApi.updateOrder(
-      orderId,
+    const validation = validateContractOrderInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Order is incomplete."),
+      );
+    }
+
+    const totals = calculateContractOrderTotals(input);
+
+    const allOrders = await getOrdersFromApi(contract.id);
+
+    /*
+     * Pending and approved orders both reserve contract value.
+     * Exclude the current order because its replacement amount is
+     * included separately below.
+     */
+    const otherCommittedOrders = allOrders.filter(
+      (item) =>
+        item.id !== orderId &&
+        (
+          item.status === CONTRACT_ORDER_STATUS.PENDING ||
+          item.status === CONTRACT_ORDER_STATUS.COMPLETED
+        ),
+    );
+
+    const otherCommittedValue = otherCommittedOrders.reduce(
+      (sum, item) => {
+        const lineTotal = normalizeNumber(item.lineTotalInclVat);
+
+        if (lineTotal > 0) {
+          return sum + lineTotal;
+        }
+
+        return (
+          sum +
+          calculateContractOrderTotals({
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+          }).lineTotalInclVat
+        );
+      },
+      0,
+    );
+
+    const newCommittedValue =
+      otherCommittedValue + totals.lineTotalInclVat;
+
+    const contractValue = Math.max(
+      0,
+      normalizeNumber(contract.contractValue),
+    );
+
+    if (newCommittedValue > contractValue) {
+      throw new Error(
+        `This correction would exceed the contract value. Committed after correction: ${newCommittedValue.toLocaleString()}; contract value: ${contractValue.toLocaleString()}.`,
+      );
+    }
+
+    await putData(
+      `/orders/${encodeURIComponent(orderId)}`,
       {
-        ...input,
+        aggregate: input.aggregate,
         quantity: normalizeNumber(input.quantity),
-        unitPrice: normalizeNumber(input.unitPrice),
-        royaltyInvoiceNumber:
-          input.royaltyInvoiceNumber.trim(),
+        royaltyInvoiceNumber: input.royaltyInvoiceNumber.trim(),
+        orderDate: contractDateForApi(input.orderDate),
       },
     );
 
-    void actor;
+    const updated = await this.getOrderById(orderId);
 
-    notifyContractsChanged();
+    if (!updated) {
+      throw new Error("The updated order could not be reloaded.");
+    }
+
+    notifyContractListeners();
+
+    void actor;
 
     return updated;
   }
+
+  /* -------------------------------------------------------------- */
+  /* Finance — cancel individual order                                */
+  /* -------------------------------------------------------------- */
 
   async cancelOrder(
     orderId: string,
@@ -1039,66 +1554,72 @@ export class ApiContractsRepository implements ContractsRepository {
       throw new Error("A cancellation reason is required.");
     }
 
-    const current = await this.getOrderById(orderId);
+    const order = await this.getOrderById(orderId);
 
-    if (!current) {
+    if (!order) {
       throw new Error("Contract order not found.");
     }
 
-    const contract = await this.getContractById(
-      current.contractId,
-    );
-
-    if (!contract) {
-      throw new Error("Contract not found.");
-    }
-
-    if (contract.status === CONTRACT_STATUS.CONVERTED) {
-      throw new Error(
-        "This contract has been converted into a Sales Invoice — its orders can no longer be cancelled here.",
-      );
-    }
-
-    if (current.status === CONTRACT_ORDER_STATUS.CANCELLED) {
+    if (order.status === CONTRACT_ORDER_STATUS.CANCELLED) {
       throw new Error("This order is already cancelled.");
     }
 
-    const cancelled = await contractsApi.cancelOrder(
-      orderId,
-      reasonText,
+    await postAction(
+      `/orders/${encodeURIComponent(orderId)}/cancel`,
+      {
+        reason: reasonText,
+      },
     );
+
+    const updated = await this.getOrderById(orderId);
+
+    if (!updated) {
+      throw new Error("The cancelled order could not be reloaded.");
+    }
+
+    notifyContractListeners();
 
     void actor;
 
-    notifyContractsChanged();
-
-    return cancelled;
+    return updated;
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Subscription                                                      */
-  /* ---------------------------------------------------------------- */
+  /* -------------------------------------------------------------- */
+  /* Subscription                                                     */
+  /* -------------------------------------------------------------- */
 
   subscribe(listener: () => void): () => void {
-    listeners.add(listener);
+    contractListeners.add(listener);
 
     return () => {
-      listeners.delete(listener);
+      contractListeners.delete(listener);
     };
   }
 }
 
-/** Single API-backed repository instance used by the application. */
+/* ------------------------------------------------------------------ */
+/* Repository instance                                                 */
+/* ------------------------------------------------------------------ */
+
 export const contractsRepository: ContractsRepository =
-  new ApiContractsRepository();
+  new LocalContractsRepository();
 
 /* ------------------------------------------------------------------ */
 /* Derived helpers                                                     */
 /* ------------------------------------------------------------------ */
 
-/** Completed, non-cancelled orders — the royalty-eligible set. */
 export function completedContractOrders(
   orders: ContractOrder[],
 ): ContractOrder[] {
-  return orders.filter(isCompletedOrder);
+  return orders.filter(
+    (order) => order.status === CONTRACT_ORDER_STATUS.COMPLETED,
+  );
+}
+
+export function pendingContractOrders(
+  orders: ContractOrder[],
+): ContractOrder[] {
+  return orders.filter(
+    (order) => order.status === CONTRACT_ORDER_STATUS.PENDING,
+  );
 }

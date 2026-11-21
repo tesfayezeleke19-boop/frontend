@@ -72,7 +72,7 @@ labelled "not confirmed".
 | VAT | 15%, invoice total is VAT-inclusive (`subtotal × 1.15`) | `SalesInvoicesController` totals; `src/services/sales/invoice.ts` |
 | Withholding | **3% of the VAT-INCLUSIVE total**, only when enabled; `net = gross − withholding` | `SalesInvoicesController` (`$withholdingRate = 0.03`, `$withholdingAmount = round($total * rate)`) |
 | Royalty | **3% of the VAT-EXCLUSIVE line total**, never VAT-inclusive | royalty SQL (`ROUND(quantity * unit_price)`) |
-| Fulfillment | Contract value vs **VAT-inclusive** fulfilled value; display capped at 100% | frontend `getContractProgress`, `getCreditContractProgress` |
+| Fulfillment | Standard contracts: contract value vs **VAT-inclusive** fulfilled value, display capped at 100%. Credit contracts have no value/threshold and use accumulated totals. | frontend `getContractProgress`, `getCreditContractTotals` |
 | Payment | Only a `PAYMENT_CONFIRMED` invoice counts as paid | sales invoice lifecycle |
 
 ---
@@ -121,10 +121,20 @@ current behaviour); not required for credit contracts (§5).
   "contractDate": "2026-01-15", "remark": "optional",
   "attachments": [ { "id": "uuid", "fileName": "contract.pdf",
     "fileUrl": "/api/sales/invoices/attachments/uuid",
-    "mimeType": "application/pdf", "fileSize": 240000 } ] }
+    "mimeType": "application/pdf", "fileSize": 240000 } ],
+  "payment": { "bank": "CBE", "paymentSender": "Abebe Kebede",
+    "paymentAmount": 7000000, "paymentDate": "2026-03-05",
+    "paymentReferenceNumber": "TXN-12345",
+    "paymentEvidence": { "id": "uuid", "fileName": "receipt.jpg",
+      "fileUrl": "/api/sales/invoices/attachments/uuid",
+      "mimeType": "image/jpeg", "fileSize": 90000 },
+    "remark": "optional" },
+  "withholding": { "enabled": true, "evidence": { "id": "uuid",
+    "fileName": "withholding.pdf", "fileUrl": "…",
+    "mimeType": "application/pdf", "fileSize": 120000 } } }
 ```
 **Validation**: customer name/TIN required; value > 0; valid date; FS No
-non-empty; attachment mime `application/pdf|image/jpeg|image/png`.
+non-empty; attachment mime `application/pdf|image/jpeg|image/png|image/webp`.
 **Response 201**: the created contract (`status: "DRAFT"`).
 
 ### 4.3 `GET /api/contracts/{id}` · `PUT /api/contracts/{id}`
@@ -165,7 +175,10 @@ Server must:
 - set `royalty_source_key = 'contract-order:{orderId}'` (unique).
 
 **Update**: must preserve the original `completedBy*` and record
-`lastEditedBy*`/`editedAt` separately.
+`lastEditedBy*`/`editedAt` separately. If the contract is already fully
+fulfilled, reject any correction that increases the VAT-inclusive fulfilled
+total (`409`); equal/lower corrections remain valid. A below-100% correction
+may cross the threshold, after which further order entry is closed.
 
 ### 4.6 Contract financial report
 `GET /api/contracts/{id}/financial-report` (Sales read of non-finance fields,
@@ -231,14 +244,14 @@ add `contract_kind ('STANDARD' | 'CREDIT')` and keep every query filtered.
 | Method + path | Purpose | Notes |
 |---|---|---|
 | `GET /api/credit-contracts` | list | Sales sees active ones |
-| `POST /api/credit-contracts` | create draft | **FS No optional**; never generate a placeholder |
+| `POST /api/credit-contracts` | create draft | **No FS No**: do not accept, require, or generate one at creation |
 | `GET/PUT /api/credit-contracts/{id}` | show / update draft | update only while `DRAFT` |
 | `POST /api/credit-contracts/{id}/activate` | `DRAFT → ACTIVE` | Finance |
 | `POST /api/credit-contracts/{id}/cancel` | `{ "reason": "…" }` | blocked once `INVOICED` |
 | `GET/POST /api/credit-contracts/{id}/orders` | list / add order | any authorized Sales user; no order limit |
 | `PUT /api/credit-contracts/{id}/orders/{orderId}` | correct | attribution preserved |
 | `POST /api/credit-contracts/{id}/orders/{orderId}/cancel` | cancel with reason | Finance |
-| `POST /api/credit-contracts/{id}/finalize` | FS No **required here**; creates ONE invoice | `{ "fsNo": "2704301", "reason": "…" }`; reason required below contract value |
+| `POST /api/credit-contracts/{id}/finalize` | FS No **required here**; creates ONE invoice | `{ "fsNo": "2704301", "reason": "…" }`; `reason` is an optional note, never a below-value justification |
 | `GET /api/credit-contracts/{id}/financial-report` | same shape as §4.6 | |
 | `GET /api/credit-contracts/{id}/invoice` | resulting invoice | for the "View Invoice" link |
 
@@ -281,7 +294,7 @@ Rules:
 - `recordedBy`/`recordedAt` come from the token; later edits keep the original
   recorder and add `updatedAt`.
 - Validation: bank/sender/reference required **when the record is submitted**;
-  amount ≥ 0; valid date; evidence type PDF/JPG/PNG.
+  amount ≥ 0; valid date; evidence type PDF/JPEG/PNG/WebP.
 
 **Withholding payload**
 ```json
@@ -462,3 +475,248 @@ pages, hooks and calculations do not change.
 6. Nothing here was tested against a running PHP backend during this task; all
    backend statements come from reading `Routes.php`, the controllers and their
    SQL.
+
+---
+
+## 12. Contract / credit-contract / royalty-batch refinement (current frontend implementation)
+
+This section documents the backend work implied by the latest frontend changes.
+The frontend is still local-first for contracts (documented limitation, §3), so
+no contract/credit-contract endpoint below exists or was called. The only real
+backend call added by this work is the already-existing authenticated
+attachment upload (`POST /api/sales/attachments/upload`), reused for payment,
+withholding, and paper-contract files; it still cannot link those files to a
+contract until the contract APIs exist.
+
+### A. Standard contracts — payment information, withholding, 100% order lock
+
+1. **Persist payment information with the contract**
+   - `POST /api/contracts` and `PUT /api/contracts/{id}` accept the nested
+     shapes the frontend actually sends:
+     `payment: { bank, paymentSender, paymentAmount, paymentDate,
+     paymentReferenceNumber, paymentEvidence: { id, fileName, fileUrl,
+     mimeType, fileSize } | null, remark } | null` and
+     `withholding: { enabled, evidence: { id, fileName, fileUrl, mimeType,
+     fileSize } | null }`.
+     The existing attachment IDs come from
+     `POST /api/sales/attachments/upload`; the backend should store the id and
+     must not trust a client-only URL/object. (`§6` uses the same nested shape.)
+     Evidence is uploaded before the contract save; if the save then fails, the
+     uploaded file is orphaned, so the backend needs attachment cleanup/linking.
+   - `payment` is optional; when present, `bank`, `paymentSender` and
+     `paymentReferenceNumber` are required. `paymentAmount` is a **reported**
+     amount, never a confirmation. A payment remark or evidence alone is still
+     payment input and is validated rather than silently discarded.
+   - Contract creation/editing requires `contractValue > 0`. Legacy zero-value
+     rows stay closed for order entry; no order may be accepted against a
+     zero/negative value. Correct them through a controlled back-office data
+     correction or recreate them — the frontend has no active-contract value
+     edit path.
+   - `withholding.enabled = true` requires an evidence attachment id.
+   - The backend derives `withholdingRate` (0.03) and `withholdingAmount`
+     (`grossInclVat × 0.03`); it must never accept a client-computed amount.
+   - `paymentHistory` is append-only
+     (`PAYMENT_INFORMATION_RECORDED|UPDATED|CLEARED`, `WITHHOLDING_UPDATED`)
+     with actor and timestamp. Append an update only when a persisted payment
+     field or the evidence attachment ID actually changed; an unrelated
+     contract edit must not produce a payment event or change `updatedAt`.
+   - Database: `contract_payment_information`, `contract_withholding` (or
+     nullable columns on `contracts`) plus `contract_payment_history`.
+
+2. **Contract financial summary**
+   - `GET /api/contracts/{id}` should return the same derived shape the
+     frontend builds in `services/contracts/financials.ts`:
+     `subtotalExclVat`, `totalVat`, `grossAmountDue`, `grossAmountDueBasis`
+     (`INVOICE` | `COMPLETED_ORDERS`), `withholdingAmount`, `netAmount`,
+     `amountPaid` (only from `PAYMENT_CONFIRMED`), `outstandingBalance`,
+     `paymentStatus`, `withholdingStatus`.
+   - `contract_value` stays VAT-inclusive; fulfillment is
+     `Σ(completed order quantity × unitPrice × 1.15)` — exactly the existing
+     frontend `getContractProgress` rule.
+
+3. **100% fulfillment closes order entry**
+   - `POST /api/contracts/{id}/orders` must, inside one transaction, lock the
+     contract row, recompute the fulfilled value from `COMPLETED` orders, and
+     reject with `409 { code: "CONTRACT_FULLY_FULFILLED" }` when
+     `fulfilledValue >= contractValue`.
+   - The rule applies to the order that **reaches** 100% (it is accepted) and
+     to every later attempt, including retries and stale forms. It is not a
+     UI-only constraint.
+   - `PUT` of an order (correction) and `POST .../cancel` must recompute and
+     return the new eligibility. A correction on a fully fulfilled contract
+     must reject any increase in fulfilled value (409) while allowing an equal
+     or lower total; the frontend applies the same rule before persisting.
+     Only a below-100% contract may be corrected up to/over 100%, which then
+     closes further entry. The frontend re-enables Add Order when fulfillment
+     drops below 100% and the lifecycle still accepts orders.
+   - Do not change the existing lifecycle: reaching 100% only flags
+     `READY_FOR_COMPLETION`; Finance still confirms and converts.
+   - Index: `contract_orders(contract_id, status)` for the sum.
+
+### B. Credit contracts — no initial value, attachments, FS No at finalization
+
+1. **Creation payload**
+   - Remove `contractValue` and `fsNo` from `POST /api/credit-contracts`
+     (and from the create validation). Accepted fields:
+     `customerName`, `tin`, `contractDate`, `remark`, `attachments[]`
+     (the uploaded metadata objects below; the frontend does not send raw IDs).
+   - `contract_value` must not be used to limit, block, or compute anything.
+     Existing rows may keep the column as `NULL`; new rows insert `NULL`.
+   - `fs_no` stays nullable until finalization.
+
+2. **Paper contract attachments**
+   - The frontend uploads each file through the existing authenticated
+     `POST /api/sales/attachments/upload` endpoint (verified: 10 MB maximum;
+     PDF/JPEG/PNG/WebP accepted server-side). It stores the returned
+     `{ id, fileName, fileUrl, mimeType, fileSize }` on the credit contract
+     payload (`attachments`). The contract API must accept these attachment
+     IDs/objects and persist them in `credit_contract_attachments`.
+   - The frontend validates PDF/JPEG/PNG/WebP and the same 10 MB limit before
+     uploading. Invalid or oversized selections block submission until the
+     error is dismissed or the file is replaced; failed uploads block saving.
+   - `POST /api/sales/attachments/upload` is invoice-namespaced and has no
+     contract linkage. If the backend adds a contract-specific upload/purpose,
+     point the frontend at it; until then, uploaded paper files have no parent
+     record if contract creation later fails. The backend needs an attachment
+     link/cleanup operation for that orphan case.
+   - Existing uploaded attachments whose `fileUrl` points at the authenticated
+     attachment route are fetched with the bearer token and displayed in-app as
+     images or PDFs after reload. Local legacy metadata without a server file is
+     labelled "metadata only" and cannot be opened; it must be re-uploaded.
+   - **Backend still required:** the invoice-namespaced upload/view route does
+     not provide per-contract attachment ownership. Contract and Credit Contract
+     APIs must persist the attachment IDs/objects and expose an authorized way
+     to resolve them after contract creation; orphan cleanup is also required.
+
+3. **Orders and finalization**
+   - `POST /api/credit-contracts/{id}/orders` is allowed only while
+     `status = ACTIVE`; no value threshold and no order-count limit.
+     Reject `DRAFT`, `INVOICED`, `CANCELLED` with `409`.
+   - `POST /api/credit-contracts/{id}/finalize` requires `fsNo` (non-empty,
+     unique per contract) and at least one completed order; it creates exactly
+     one Sales Invoice and freezes the orders.
+   - Idempotency: accept an `Idempotency-Key`; a retry must return the same
+     invoice instead of creating a second one (`contractId` on the invoice is
+     the second guard).
+   - Finalization must **not** require a reason for being "below value" —
+     credit contracts have no initial value. An optional note may be stored.
+   - Accumulated totals (`completedOrderCount`, VAT-inclusive order value,
+     VAT-exclusive royalty base) are computed from the orders, not stored on
+     the contract.
+
+4. **Finalization recovery (local guard)**
+   - The frontend stores a local `finalizationStartedAt` marker and refuses a
+     second attempt while it is recent. It clears the marker only after a
+     conservative 10-minute timeout when no invoice linked to the contract is
+     found — never merely because the page was refreshed.
+   - The backend must still provide the authoritative idempotency guarantee
+     (`Idempotency-Key`, unique `contractId` on the invoice) and a recovery
+     path for an interrupted finalization; the local marker is not a
+     cross-session lock.
+
+### C. Royalty batches — 50 records, history download, integrity
+
+Existing and verified against `Routes.php` / `FinanceRoyaltyReportsController`:
+`GET /api/finance/royalty-reports`, `GET
+/api/finance/royalty-reports/batches`, and `POST
+/api/finance/royalty-reports/batches`. The backend excludes rows that belong
+to a finalized batch and persists batch totals.
+
+**Current behavior (not yet the required behavior):** `POST /batches` accepts
+1–50 keys, revalidates eligibility under an advisory transaction lock, and
+returns `409` when a retry contains rows already finalized. It does **not**
+return the existing batch for an idempotent replay, and it does **not** enforce
+exactly 50. Its `authenticate()` check verifies a valid active session only —
+there is no Finance-role authorization.
+
+**Finalization trigger (current decision).** The backend exposes no reliable
+"complete the batch when the 50th record is registered" operation. The
+frontend therefore never finalizes from page load, refresh or navigation:
+those are read-only. A batch that reaches 50 is marked
+"ready — Finance must finalize it" and an authorized Finance user presses the
+existing **Finalize Batch (50)** action. Do not replace this with a client-side
+auto-finalize effect. If the backend later gains an atomic, idempotent
+completion-on-50th-record trigger, it must live entirely on the server and the
+frontend should only refresh after notification.
+
+Required additions/changes:
+
+1. **Atomic 50-record batch creation**
+   - The frontend now rejects anything other than exactly 50 unique keys and
+     detects duplicate keys. Partial exports remain separate and never create a
+     completed batch. `POST /batches` must enforce the same exact-50 rule
+     atomically (unless a separately approved partial-close feature is added).
+   - When 50 eligible, unfinalized rows exist, `POST /batches` must create the
+     batch, persist its exact row membership and totals, and mark those rows as
+     finalized in ONE transaction, returning the batch.
+   - Membership is immutable. A row can appear in at most one completed batch
+     (unique index on the row key / source reference).
+   - Retries are idempotent: same `Idempotency-Key` or the same set of row keys
+     must return the existing batch instead of creating another. Current 409
+     behavior is a safe rejection but not idempotent replay. The frontend's
+     in-flight ref/disabled button only prevents double clicks in ONE tab; it
+     is not cross-user or cross-session idempotency, and the backend must reject
+     a second batch containing already-finalized rows.
+   - A second Finance user finalizing the same 50 rows concurrently must result
+     in ONE batch and a clear conflict response (for example
+     `409 { code: "BATCH_ALREADY_COMPLETED" }`); the frontend then reloads the
+     current rows and Batch History instead of retrying.
+   - After an unknown/timeout outcome the frontend reloads both views, because
+     the server may have committed the batch before the response was lost.
+     The backend endpoint must be safe to retry with the same row keys.
+   - Rows beyond 50 stay eligible for the next batch.
+
+2. **Batch history**
+   - `GET /batches` returns `id`, `batchNumber`, `recordCount`, `totalSales`,
+     `totalRoyalty`, `createdAt`, `status`, `orderIds` (membership).
+   - Add `GET /batches/{id}` returning `{ batch, rows[] }`. `batch` must
+     include the persisted `recordCount` (and ideally `batchNumber`,
+     `totalSales`, `totalRoyalty`); `rows` must be the **snapshot** of the 7
+     report columns (`date`, `royaltyInvoiceNumber`, `aggregate`, `quantity`,
+     `unitPrice`, `lineTotalExclVat`, `royalty`). The frontend refuses to export
+     if `batch` metadata is missing, `recordCount` is invalid, or
+     `rows.length !== batch.recordCount`; it never rebuilds a batch from live
+     rows.
+   - Reuse the existing `royalty_batch_items` table as the snapshot; it already
+     stores `invoice_line_id`, `contract_order_id`, `source_order_number`,
+     `royalty_invoice_number`, `aggregate`, `quantity`, `unit_price`,
+     `line_total_excl_vat`, `royalty_rate`, `royalty_amount`, and
+     `source_order_date`. Do not create a duplicate `royalty_batch_rows` table.
+     Add the read endpoint and return `source_order_date` as the `date` value.
+   - Per-row `royalty_amount` is authoritative for exports; the frontend uses
+     it when present and only falls back to `round(line_total_excl_vat × 0.03)`
+     for rows that do not carry a snapshot royalty.
+
+3. **Corrections after completion**
+   - A completed batch is a historical reporting unit: editing a source order
+     must not mutate its snapshot or totals. Corrections should be handled
+     with an explicit revision/adjustment record (or a new batch) and
+     documented in the audit log. The frontend currently cannot express such a
+     correction, so no silent rewrite is possible.
+
+4. **Finance-role authorization (security blocker)**
+   - Affected existing endpoints: `GET /api/finance/royalty-reports`,
+     `GET /api/finance/royalty-reports/batches`, and `POST
+     /api/finance/royalty-reports/batches` (and the proposed
+     `GET /batches/{id}`).
+   - Current `FinanceRoyaltyReportsController::authenticate()` checks only for a
+     valid bearer session and an active account. It does not check the user's
+     role, so any authenticated user can read royalty/financial data and create
+     a finalized batch through the API.
+   - Required: Finance-role authorization on every Finance-only royalty
+     operation, returning `401` for missing/invalid sessions and `403` for
+     authenticated users without Finance permission. Batch finalization must be
+     Finance-only.
+   - Hiding or disabling the button in the frontend is not a security boundary.
+     This is a backend blocker before production; the frontend alone cannot fix
+     it.
+
+### D. Compatibility summary
+
+| Area | Backend today | Frontend now | Required backend work |
+|---|---|---|---|
+| Standard contracts | localStorage repository; existing attachment upload endpoint | payment/withholding at create+edit with real evidence upload, 100% add + correction lock enforced in repo | persist financial fields/evidence IDs; atomic fulfillment and correction checks; 409 error |
+| Credit contracts | localStorage repository | no contract value, no FS No at create; paper files uploaded via existing attachment endpoint; FS No at finalize; no value threshold | column/payload changes, attachment link/cleanup + join, finalize validation |
+| Royalty batches | `GET /batches`, `POST /batches` (existing, 1–50, 409 on retry, no role check); no completion-on-50th trigger | explicit Finance `Finalize Batch` at 50; page load is read-only; frontend enforces exactly 50 unique keys and verifies snapshot count; per-batch Download | Finance-role authorization, exact-50 atomic enforcement, `GET /batches/{id}` with `recordCount` + reuse of `royalty_batch_items`, unique membership, idempotent replay |
+| Expenses | existing Finance/Admin APIs | API repository now notifies subscribers after mutations | none |
+| Sales invoice | existing | New Invoice resets the form instead of reusing the submitted invoice | none |

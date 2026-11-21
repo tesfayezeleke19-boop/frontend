@@ -1,3 +1,4 @@
+
 /**
  * Contract Orders — shared list page (Finance and Sales).
  *
@@ -26,7 +27,6 @@ import {
   FileText,
   Loader2,
   Plus,
-  Info,
   Search,
   ScrollText,
   TrendingUp,
@@ -68,8 +68,14 @@ export default function Contracts() {
     ? "/finance"
     : "/sales";
 
-  const { data: contracts, loading } = useContracts();
+  const {
+    data: contracts,
+    loading,
+    refresh: refreshContracts,
+  } = useContracts();
+
   const { data: orders } = useAllContractOrders();
+
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<string>("ALL");
   const [from, setFrom] = useState("");
@@ -106,14 +112,18 @@ export default function Contracts() {
     let fulfilled = 0;
     let active = 0;
     let orderCount = 0;
+
     for (const contract of contracts ?? []) {
       const contractOrders = ordersByContract.get(contract.id) ?? [];
       const progress = getContractProgress(contract, contractOrders);
+
       contractValue += progress.contractValue;
       fulfilled += progress.fulfilledValue;
       orderCount += contractOrders.length;
-      if (contract.status === CONTRACT_STATUS.IN_PROGRESS) active += 1;
+
+      if (contract.status === CONTRACT_STATUS.ACTIVE) active += 1;
     }
+
     return { contractValue, fulfilled, active, orderCount };
   }, [contracts, ordersByContract]);
 
@@ -123,9 +133,21 @@ export default function Contracts() {
       value: String(contracts?.length ?? 0),
       icon: ScrollText,
     },
-    { label: "Active (In Progress)", value: String(totals.active), icon: TrendingUp },
-    { label: "Total Contract Value", value: formatCurrency(totals.contractValue), icon: FileText },
-    { label: "Fulfilled Value", value: formatCurrency(totals.fulfilled), icon: FileText },
+    {
+      label: "Active Contracts",
+      value: String(totals.active),
+      icon: TrendingUp,
+    },
+    {
+      label: "Total Contract Value",
+      value: formatCurrency(totals.contractValue),
+      icon: FileText,
+    },
+    {
+      label: "Fulfilled Value",
+      value: formatCurrency(totals.fulfilled),
+      icon: FileText,
+    },
   ];
 
   if (loading && !contracts) {
@@ -144,6 +166,7 @@ export default function Contracts() {
             Contract Orders
           </h1>
         </div>
+
         {isFinance && (
           <Button
             onClick={() => setFormOpen(true)}
@@ -155,8 +178,6 @@ export default function Contracts() {
         )}
       </div>
 
-      
-
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {stats.map((stat) => (
           <Card key={stat.label} className="border-border bg-card shadow-none">
@@ -167,6 +188,7 @@ export default function Contracts() {
                 </span>
                 <stat.icon className="size-4 text-muted-foreground/70" />
               </div>
+
               <div className="mt-2 text-lg font-semibold tabular-nums text-foreground">
                 {stat.value}
               </div>
@@ -186,12 +208,15 @@ export default function Contracts() {
             className="h-9 border-input bg-popover pl-8 text-sm text-foreground placeholder:text-muted-foreground/70"
           />
         </div>
+
         <Select value={status} onValueChange={setStatus}>
           <SelectTrigger className="h-9 w-48 border-input bg-popover text-sm text-foreground">
             <SelectValue />
           </SelectTrigger>
+
           <SelectContent className="border-input bg-popover">
             <SelectItem value="ALL">All statuses</SelectItem>
+
             {Object.values(CONTRACT_STATUS).map((value) => (
               <SelectItem key={value} value={value}>
                 {CONTRACT_STATUS_LABELS[value]}
@@ -199,25 +224,26 @@ export default function Contracts() {
             ))}
           </SelectContent>
         </Select>
+
         <div className="flex items-center gap-2">
-  <div className="w-40">
-    <EthiopianDatePicker
-      value={from}
-      onChange={setFrom}
-      placeholder="From date"
-    />
-  </div>
+          <div className="w-40">
+            <EthiopianDatePicker
+              value={from}
+              onChange={setFrom}
+              placeholder="From date"
+            />
+          </div>
 
-  <span className="text-xs text-muted-foreground/70">to</span>
+          <span className="text-xs text-muted-foreground/70">to</span>
 
-  <div className="w-40">
-    <EthiopianDatePicker
-      value={to}
-      onChange={setTo}
-      placeholder="To date"
-    />
-  </div>
-</div>
+          <div className="w-40">
+            <EthiopianDatePicker
+              value={to}
+              onChange={setTo}
+              placeholder="To date"
+            />
+          </div>
+        </div>
       </div>
 
       {/* Contract table */}
@@ -234,17 +260,39 @@ export default function Contracts() {
                     <th className="px-4 py-2.5 text-right font-medium">
                       Contract Value
                     </th>
-                    <th className="px-4 py-2.5 text-right font-medium">Fulfilled</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Remaining</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Orders</th>
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Fulfilled
+                    </th>
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Remaining
+                    </th>
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Orders
+                    </th>
                     <th className="px-4 py-2.5 font-medium">Contract Date</th>
                     <th className="px-4 py-2.5 font-medium">Status</th>
                   </tr>
                 </thead>
+
                 <tbody>
                   {visible.map((contract) => {
-                    const contractOrders = ordersByContract.get(contract.id) ?? [];
-                    const progress = getContractProgress(contract, contractOrders);
+                    const contractOrders =
+                      ordersByContract.get(contract.id) ?? [];
+
+                    const progress = getContractProgress(
+                      contract,
+                      contractOrders,
+                    );
+
+                    const statusUi =
+                      CONTRACT_STATUS_UI[
+                        contract.status as keyof typeof CONTRACT_STATUS_UI
+                      ] ?? {
+                        label: "Unknown status",
+                        className:
+                          "border-muted-foreground/30 bg-muted text-muted-foreground",
+                      };
+
                     return (
                       <tr
                         key={contract.id}
@@ -258,35 +306,47 @@ export default function Contracts() {
                             {contract.contractNumber}
                           </Link>
                         </td>
+
                         <td className="px-4 py-2.5 text-foreground">
                           {contract.customer.name}
                         </td>
+
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                           {contract.fsNo}
                         </td>
+
                         <td className="px-4 py-2.5 text-right tabular-nums text-foreground">
                           {formatCurrency(progress.contractValue)}
                         </td>
+
                         <td className="px-4 py-2.5 text-right tabular-nums text-foreground">
                           {formatCurrency(progress.fulfilledValue)}
+
+                          {progress.reachedValue && (
+                            <div className="font-mono text-[9px] uppercase tracking-wide text-success">
+                              100% — order entry closed
+                            </div>
+                          )}
                         </td>
+
                         <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
                           {formatCurrency(progress.remainingValue)}
                         </td>
+
                         <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
                           {progress.orderCount}
                         </td>
+
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                           {formatDate(contract.contractDate)}
                         </td>
+
                         <td className="px-4 py-2.5">
                           <Badge
                             variant="outline"
-                            className={`border text-[10px] font-medium ${
-                              CONTRACT_STATUS_UI[contract.status].className
-                            }`}
+                            className={`border text-[10px] font-medium ${statusUi.className}`}
                           >
-                            {CONTRACT_STATUS_UI[contract.status].label}
+                            {statusUi.label}
                           </Badge>
                         </td>
                       </tr>
@@ -298,9 +358,11 @@ export default function Contracts() {
           ) : (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <FileText className="mb-3 size-8 text-muted-foreground" />
+
               <p className="text-sm font-medium text-foreground">
                 No contracts match the current view
               </p>
+
               <p className="mt-1 text-xs text-muted-foreground">
                 {isFinance
                   ? "Create a contract to make it available to the Sales team."
@@ -315,7 +377,9 @@ export default function Contracts() {
         <ContractFormDialog
           open={formOpen}
           onOpenChange={setFormOpen}
-          onSaved={() => undefined}
+          onSaved={() => {
+            refreshContracts();
+          }}
         />
       )}
     </div>

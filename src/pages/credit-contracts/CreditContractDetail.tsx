@@ -1,19 +1,26 @@
 
 /** Credit Contract detail — the working screen for ONE credit contract.
+ *
+ * Finance:
+ * - Creates and activates credit contracts.
+ * - Manages contract information.
+ * - Completes active credit contracts through the credit-specific payment form.
+ *
+ * Sales:
+ * - Can view all active credit contracts.
+ * - Can create orders against active credit contracts only.
+ *
+ * Each credit contract order is registered as an individual Sales Invoice.
+ * On completion, Finance supplies the FS No and payment information.
+ * The backend must assign the FS No to the existing Sales Invoices and
+ * prevent further orders against the completed contract.
+ *
+ * All persistence is handled through the backend API. No localStorage.
+ */
 
-Finance: customer/contract information, fulfillment summary, order history,
-status actions (activate, cancel, finalize into a Sales Invoice), and the
-audit trail.
-
-Sales: the same contract information and the Add Order action for any active
-credit contract (no assignment needed).
-
-Completed orders keep their royalty basis here. The shared Royalty Report lives
-in the existing Royalty Reports page — this screen never duplicates it, and
-contract orders reach that report once the backend persists them.
-*/
 import { useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
+
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -23,6 +30,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+
 import {
   Dialog,
   DialogContent,
@@ -31,18 +39,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+
 import { Textarea } from "@/components/ui/textarea";
+
 import {
   ArrowLeft,
-  CheckCircle2,
   FileText,
   Loader2,
+  Paperclip,
   Pencil,
   Plus,
   ScrollText,
   ShieldCheck,
+  Wallet,
   XCircle,
 } from "lucide-react";
+
 import { toast } from "sonner";
 
 import { useAuth } from "@/hooks/use-auth";
@@ -58,7 +70,6 @@ import {
 import { creditContractsRepository } from "@/services/creditContracts/repository";
 
 import { ContractFinancialReportCard } from "@/components/contracts/ContractFinancialReportCard";
-import { ContractPaymentDialog } from "@/components/contracts/ContractPaymentDialog";
 import { ContractPaymentSection } from "@/components/contracts/ContractPaymentSection";
 
 import {
@@ -69,43 +80,21 @@ import {
   type CreditContractOrder,
 } from "@/services/creditContracts/types";
 
-import { formatCurrency } from "@/services/sales/format";
+import {
+  formatCurrency,
+  formatDate,
+} from "@/services/sales/format";
 
 import { CreditContractFormDialog } from "@/components/credit-contracts/CreditContractFormDialog";
 import { CreditOrderDialog } from "@/components/credit-contracts/CreditOrderDialog";
+import { CreditContractPaymentDialog } from "@/components/credit-contracts/CreditContractPaymentDialog";
+import { AttachmentViewer } from "@/components/contracts/AttachmentViewer";
 
-/**
- * Display date values in the Ethiopian calendar.
- * Date-only API strings are parsed at local noon to avoid timezone shifts.
- */
-function formatEthiopianDate(
-  value: number | string | null | undefined,
-): string {
-  if (value === null || value === undefined || value === "") {
-    return "—";
-  }
-
-  const date =
-    typeof value === "number"
-      ? new Date(value)
-      : new Date(
-          /^\d{4}-\d{2}-\d{2}$/.test(value)
-            ? `${value}T12:00:00`
-            : value,
-        );
-
-  if (Number.isNaN(date.getTime())) return "—";
-
-  return new Intl.DateTimeFormat("en-ET-u-ca-ethiopic-nu-latn", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  }).format(date);
-}
+import type { ContractAttachment } from "@/services/contracts/types";
+import type { CreditContractCompletionInput } from "@/components/credit-contracts/CreditContractPaymentDialog";
 
 export default function CreditContractDetail() {
   const { id } = useParams<{ id: string }>();
-
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -139,28 +128,29 @@ export default function CreditContractDetail() {
   } = useCreditContractFinancialReport(id);
 
   const [formOpen, setFormOpen] = useState(false);
-  const [financialOpen, setFinancialOpen] = useState(false);
+  const [paymentOpen, setPaymentOpen] = useState(false);
 
-  const [dialog, setDialog] = useState<
-    "activate" | "cancel" | "finalize" | null
-  >(null);
+  const [dialog, setDialog] = useState<"activate" | "cancel" | null>(
+    null,
+  );
 
   const [orderDialogOpen, setOrderDialogOpen] = useState(false);
 
   const [editingOrder, setEditingOrder] =
     useState<CreditContractOrder | null>(null);
 
-  const [reason, setReason] = useState("");
-  const [fsNo, setFsNo] = useState("");
+  const [viewingAttachment, setViewingAttachment] =
+    useState<ContractAttachment | null>(null);
 
+  const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
 
   if (loading && !contract) {
     return (
       <div className="flex items-center justify-center py-20">
-        <Loader2
-          className="size-7 animate-spin text-muted-foreground"
-          aria-label="Loading contract"
+        <div
+          className="size-6 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-primary"
+          aria-label="Loading credit contract"
         />
       </div>
     );
@@ -177,9 +167,7 @@ export default function CreditContractDetail() {
 
         <Button
           variant="outline"
-          onClick={() =>
-            navigate(`${portalBase}/credit-contracts`)
-          }
+          onClick={() => navigate(`${portalBase}/credit-contracts`)}
           className="mt-4 border-input text-foreground hover:bg-accent"
         >
           <ArrowLeft className="size-4" />
@@ -193,8 +181,14 @@ export default function CreditContractDetail() {
 
   const accepted = creditContractAcceptsOrders(contract.status);
 
+  const isActive =
+    contract.status === CREDIT_CONTRACT_STATUS.ACTIVE;
+
+  const isCompleted =
+    contract.status === CREDIT_CONTRACT_STATUS.INVOICED;
+
   const canEditOrder = (order: CreditContractOrder) =>
-    contract.status !== CREDIT_CONTRACT_STATUS.INVOICED &&
+    accepted &&
     order.status === CREDIT_ORDER_STATUS.COMPLETED &&
     (
       isFinance ||
@@ -204,21 +198,12 @@ export default function CreditContractDetail() {
       )
     );
 
-  const progress = financials?.progress;
-
-  const closedBelowValue =
-    Boolean(contract.closedBelowValue) ||
-    (
-      !!progress &&
-      progress.fulfilledValue < progress.contractValue
-    );
+  const totals = financials?.totals;
 
   const runAction = async (
     action: () => Promise<unknown>,
     success: string,
   ) => {
-    if (busy) return;
-
     setBusy(true);
 
     try {
@@ -228,8 +213,7 @@ export default function CreditContractDetail() {
 
       setDialog(null);
       setReason("");
-      setFsNo("");
-    } catch (error: unknown) {
+    } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
@@ -239,6 +223,16 @@ export default function CreditContractDetail() {
       setBusy(false);
     }
   };
+
+  const handleCompleteCredit = async (
+  input: CreditContractCompletionInput,
+) => {
+  if (!id) {
+    throw new Error("Credit contract ID is missing");
+  }
+
+  await creditContractsRepository.finalizeContract(id, input);
+};
 
   return (
     <div className="space-y-5">
@@ -270,13 +264,13 @@ export default function CreditContractDetail() {
 
           <p className="mt-1 text-sm text-muted-foreground">
             {contract.customer.name} · TIN{" "}
-            {contract.customer.tin} · FS No{" "}
-            {contract.fsNo || "—"} ·{" "}
-            {formatEthiopianDate(contract.contractDate)}
+            {contract.customer.tin} · FS No {contract.fsNo || "—"} ·{" "}
+            {formatDate(contract.contractDate)}
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {/* Sales: add order only while contract accepts orders */}
           {isSales && accepted && (
             <Button
               onClick={() => {
@@ -290,6 +284,7 @@ export default function CreditContractDetail() {
             </Button>
           )}
 
+          {/* Finance: edit and activate draft */}
           {isFinance &&
             contract.status === CREDIT_CONTRACT_STATUS.DRAFT && (
               <>
@@ -303,9 +298,7 @@ export default function CreditContractDetail() {
                 </Button>
 
                 <Button
-                  onClick={() => {
-                    setDialog("activate");
-                  }}
+                  onClick={() => setDialog("activate")}
                   className="gap-2 bg-success text-primary-foreground hover:bg-success"
                 >
                   <ShieldCheck className="size-4" />
@@ -314,98 +307,70 @@ export default function CreditContractDetail() {
               </>
             )}
 
-          {isFinance &&
-            contract.status === CREDIT_CONTRACT_STATUS.ACTIVE && (
-              <>
-                <Button
-                  variant="outline"
-                  onClick={() => setDialog("cancel")}
-                  className="gap-2 border-input text-foreground hover:bg-accent"
-                >
-                  <XCircle className="size-4" />
-                  Cancel Contract
-                </Button>
+          {/* Finance: complete active credit contract */}
+          {isFinance && isActive && (
+            <Button
+              onClick={() => setPaymentOpen(true)}
+              className="gap-2 bg-success text-primary-foreground hover:bg-success"
+            >
+              <Wallet className="size-4" />
+              Complete Credit
+            </Button>
+          )}
 
-                <Button
-                  onClick={() => setDialog("finalize")}
-                  className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
-                >
-                  <CheckCircle2 className="size-4" />
-                  Finalize
-                </Button>
-              </>
-            )}
+          {/* Finance: cancel active contract */}
+          {isFinance && isActive && (
+            <Button
+              variant="outline"
+              onClick={() => setDialog("cancel")}
+              className="gap-2 border-input text-foreground hover:bg-accent"
+            >
+              <XCircle className="size-4" />
+              Cancel Contract
+            </Button>
+          )}
         </div>
       </div>
 
-      {/* Fulfillment summary */}
-      {progress && (
+      {/* Accumulated orders */}
+      {totals && (
         <Card className="border-border bg-card shadow-none">
           <CardHeader className="pb-3">
             <CardTitle className="text-sm font-medium text-foreground">
-              Fulfillment
+              Accumulated Orders
             </CardTitle>
+
           </CardHeader>
 
           <CardContent className="p-0">
-            <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-3 md:grid-cols-3">
               <div className="rounded-lg border border-border bg-sidebar p-3">
                 <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                  Contract Value
+                  Completed Orders
                 </div>
 
                 <div className="mt-1 text-lg font-semibold tabular-nums text-foreground">
-                  {formatCurrency(progress.contractValue)}
+                  {totals.completedOrderCount}
                 </div>
               </div>
 
               <div className="rounded-lg border border-border bg-sidebar p-3">
                 <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                  Fulfilled Value
+                  Order Value (incl. VAT)
                 </div>
 
                 <div className="mt-1 text-lg font-semibold tabular-nums text-foreground">
-                  {formatCurrency(progress.fulfilledValue)}
+                  {formatCurrency(totals.fulfilledValue)}
                 </div>
               </div>
 
               <div className="rounded-lg border border-border bg-sidebar p-3">
                 <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                  Remaining
+                  Royalty Base (excl. VAT)
                 </div>
 
-                <div className="mt-1 text-lg font-semibold tabular-nums text-muted-foreground">
-                  {formatCurrency(progress.remainingValue)}
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-border bg-sidebar p-3">
-                <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                  Fulfillment
-                </div>
-
-                <div className="mt-1 flex items-center gap-2">
-                  <div className="h-3 overflow-hidden rounded-full border border-border bg-muted">
-                    <div
-                      className={`h-full transition-all ${
-                        progress.fulfillmentPercent >= 100
-                          ? "bg-success"
-                          : progress.fulfillmentPercent >= 70
-                            ? "bg-warning"
-                            : "bg-info"
-                      }`}
-                      style={{
-                        width: `${Math.min(
-                          100,
-                          progress.fulfillmentPercent,
-                        )}%`,
-                      }}
-                    />
-                  </div>
-
-                  <span className="text-sm font-medium tabular-nums text-foreground">
-                    {progress.fulfillmentPercent.toFixed(1)}%
-                  </span>
+                <div className="mt-1 text-lg font-semibold tabular-nums text-foreground">
+                  {formatCurrency(totals.royaltyBase)}
                 </div>
               </div>
             </div>
@@ -413,22 +378,92 @@ export default function CreditContractDetail() {
         </Card>
       )}
 
+      {/* Paper contract attachments */}
+      <Card className="border-border bg-card shadow-none">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-medium text-foreground">
+            Paper Contract Attachments ({contract.attachments.length})
+          </CardTitle>
+        </CardHeader>
+
+        <CardContent className="pt-0">
+          {contract.attachments.length > 0 ? (
+            <ul className="space-y-2">
+              {contract.attachments.map((attachment) => (
+                <li
+                  key={attachment.id}
+                  className="flex items-center gap-3 rounded-md border border-border bg-sidebar p-2"
+                >
+                  <span className="flex size-10 items-center justify-center rounded border border-input bg-popover">
+                    <Paperclip className="size-4 text-muted-foreground" />
+                  </span>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-medium text-foreground">
+                      {attachment.fileName}
+                    </div>
+
+                    <div className="font-mono text-[10px] text-muted-foreground/70">
+                      {attachment.mimeType || "unknown"} ·{" "}
+                      {Math.max(
+                        1,
+                        Math.round(attachment.fileSize / 1024),
+                      )}{" "}
+                      KB
+                    </div>
+                  </div>
+
+                  {(
+  attachment.fileUrl ||
+  `/api/credit-contracts/${encodeURIComponent(contract.id)}/attachments/${encodeURIComponent(attachment.id)}`
+).startsWith("/api/") ? (
+  <Button
+    variant="ghost"
+    size="sm"
+    onClick={() =>
+      setViewingAttachment({
+        ...attachment,
+        fileUrl:
+          attachment.fileUrl ||
+          `/api/credit-contracts/${encodeURIComponent(contract.id)}/attachments/${encodeURIComponent(attachment.id)}`,
+      })
+    }
+    className="h-7 font-mono text-[10px] uppercase tracking-[0.14em] text-info hover:underline"
+  >
+    View
+  </Button>
+) : (
+                    <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
+                      metadata only
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No paper contract uploaded. Attachments are optional.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Payment information */}
       {report && (
         <ContractPaymentSection
           report={report}
-          canManage={
-            isFinance &&
-            contract.status !== CREDIT_CONTRACT_STATUS.CANCELLED
-          }
-          onEdit={() => setFinancialOpen(true)}
+          canManage={false}
+          onEdit={() => setPaymentOpen(true)}
           title={contract.contractNumber}
         />
       )}
 
-      {/* Completed-contract financial report */}
-      {contract.status === CREDIT_CONTRACT_STATUS.INVOICED && report && (
-        <ContractFinancialReportCard report={report} />
+      {/* Completed contract financial report */}
+      {isCompleted && report && (
+        <ContractFinancialReportCard
+          report={report}
+          showFulfillment={false}
+        />
       )}
 
       {/* Order list */}
@@ -464,26 +499,16 @@ export default function CreditContractDetail() {
                   <tr className="border-b border-border bg-muted text-left font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
                     <th className="px-4 py-2.5 font-medium">Order</th>
                     <th className="px-4 py-2.5 font-medium">Aggregate</th>
-                    <th className="px-4 py-2.5 text-right font-medium">
-                      Quantity
-                    </th>
-                    <th className="px-4 py-2.5 text-right font-medium">
-                      Unit Price
-                    </th>
-                    <th className="px-4 py-2.5 text-right font-medium">
-                      Line Total (excl. VAT)
-                    </th>
-                    <th className="px-4 py-2.5 text-right font-medium">
-                      Line Total (incl. VAT)
-                    </th>
-                    <th className="px-4 py-2.5 font-medium">
-                      Royalty Invoice No.
-                    </th>
+                    <th className="px-4 py-2.5 text-right font-medium">Quantity</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Unit Price</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Line Total (excl. VAT)</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Line Total (incl. VAT)</th>
+                    <th className="px-4 py-2.5 font-medium">Royalty Invoice No.</th>
                     <th className="px-4 py-2.5 font-medium">Order Date</th>
                     <th className="px-4 py-2.5 font-medium">Completed By</th>
                     <th className="px-4 py-2.5 font-medium">Status</th>
 
-                    {(isFinance || contractOrders.some(canEditOrder)) && (
+                    {contractOrders.some(canEditOrder) && (
                       <th className="px-4 py-2.5 font-medium">Actions</th>
                     )}
                   </tr>
@@ -524,7 +549,7 @@ export default function CreditContractDetail() {
                       </td>
 
                       <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                        {formatEthiopianDate(order.orderDate)}
+                        {formatDate(order.orderDate)}
                       </td>
 
                       <td className="px-4 py-2.5 text-xs text-muted-foreground">
@@ -556,27 +581,22 @@ export default function CreditContractDetail() {
                         </Badge>
                       </td>
 
-                      {(isFinance ||
-                        (
-                          canEditOrder(order) &&
-                          order.status === CREDIT_ORDER_STATUS.COMPLETED
-                        )) && (
+                      {contractOrders.some(canEditOrder) && (
                         <td className="px-4 py-2.5 text-right">
-                          {canEditOrder(order) &&
-                            order.status === CREDIT_ORDER_STATUS.COMPLETED && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => {
-                                  setEditingOrder(order);
-                                  setOrderDialogOpen(true);
-                                }}
-                                className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
-                              >
-                                <Pencil className="size-3" />
-                                Edit
-                              </Button>
-                            )}
+                          {canEditOrder(order) && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => {
+                                setEditingOrder(order);
+                                setOrderDialogOpen(true);
+                              }}
+                              className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
+                            >
+                              <Pencil className="size-3" />
+                              Edit
+                            </Button>
+                          )}
                         </td>
                       )}
                     </tr>
@@ -606,9 +626,7 @@ export default function CreditContractDetail() {
       <Dialog
         open={dialog === "activate"}
         onOpenChange={(open) => {
-          if (!open && !busy) {
-            setDialog(null);
-          }
+          if (!open) setDialog(null);
         }}
       >
         <DialogContent className="border-input bg-card">
@@ -622,64 +640,27 @@ export default function CreditContractDetail() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">
-              Are you sure you want to activate this credit contract?
-              Once activated, Sales users will be able to add orders
-              against this contract.
-            </p>
-
-            <div className="rounded-lg border border-border bg-sidebar p-3 text-sm">
-              <div className="flex justify-between gap-3">
-                <span className="text-muted-foreground">Customer</span>
-
-                <span className="font-medium text-foreground">
-                  {contract.customer.name}
-                </span>
-              </div>
-
-              <div className="mt-2 flex justify-between gap-3">
-                <span className="text-muted-foreground">
-                  Contract Value
-                </span>
-
-                <span className="font-medium text-foreground">
-                  {formatCurrency(contract.contractValue)}
-                </span>
-              </div>
-
-              <div className="mt-2 flex justify-between gap-3">
-                <span className="text-muted-foreground">
-                  Current Status
-                </span>
-
-                <span className="font-medium text-foreground">
-                  DRAFT
-                </span>
-              </div>
-            </div>
-          </div>
+          <p className="text-sm text-muted-foreground">
+            Activating this credit contract makes it available to the Sales
+            team. Sales users can then create orders against it. Each order
+            will be registered as an individual credit Sales Invoice.
+          </p>
 
           <DialogFooter>
             <Button
-              type="button"
               variant="outline"
               onClick={() => setDialog(null)}
-              disabled={busy}
               className="border-input"
             >
-              Cancel
+              Back
             </Button>
 
             <Button
-              type="button"
               onClick={() =>
                 runAction(
                   () =>
-                    creditContractsRepository.activateContract(
-                      contract.id,
-                    ),
-                  "Credit contract activated successfully",
+                    creditContractsRepository.activateContract(contract.id),
+                  "Credit contract activated",
                 )
               }
               disabled={busy}
@@ -688,13 +669,10 @@ export default function CreditContractDetail() {
               {busy ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Activating...
+                  Activating…
                 </>
               ) : (
-                <>
-                  <ShieldCheck className="size-4" />
-                  Confirm Activation
-                </>
+                "Activate Contract"
               )}
             </Button>
           </DialogFooter>
@@ -705,9 +683,7 @@ export default function CreditContractDetail() {
       <Dialog
         open={dialog === "cancel"}
         onOpenChange={(open) => {
-          if (!open && !busy) {
-            setDialog(null);
-          }
+          if (!open) setDialog(null);
         }}
       >
         <DialogContent className="border-input bg-card">
@@ -723,9 +699,8 @@ export default function CreditContractDetail() {
 
           <div className="space-y-3">
             <p className="text-sm text-muted-foreground">
-              This credit contract cannot accept new orders after you cancel it.
-              Completed orders stay on the record; the contract is not converted
-              into a Sales Invoice.
+              This credit contract cannot accept new orders after you cancel
+              it. Existing orders and their Sales Invoices remain on record.
             </p>
 
             <Label className="text-xs font-medium text-muted-foreground">
@@ -745,10 +720,9 @@ export default function CreditContractDetail() {
             <Button
               variant="outline"
               onClick={() => setDialog(null)}
-              disabled={busy}
               className="border-input"
             >
-              Cancel
+              Back
             </Button>
 
             <Button
@@ -778,147 +752,19 @@ export default function CreditContractDetail() {
         </DialogContent>
       </Dialog>
 
-      {/* Finalize dialog */}
-      <Dialog
-        open={dialog === "finalize"}
-        onOpenChange={(open) => {
-          if (!open && !busy) {
-            setDialog(null);
-          }
-        }}
-      >
-        <DialogContent className="border-input bg-card">
-          <DialogHeader>
-            <DialogTitle className="font-mono text-lg font-semibold text-foreground">
-              Finalize Credit Contract
-            </DialogTitle>
-
-            <DialogDescription className="text-sm text-muted-foreground">
-              {contract.contractNumber} · {contract.customer.name}
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-3">
-            {progress && (
-              <div className="rounded-lg border border-border bg-sidebar p-3 text-xs text-muted-foreground">
-                <div className="font-medium text-foreground">
-                  Fulfillment: {progress.fulfillmentPercent.toFixed(1)}% ·{" "}
-                  {formatCurrency(progress.fulfilledValue)} of{" "}
-                  {formatCurrency(progress.contractValue)}
-                </div>
-
-                {closedBelowValue &&
-                  progress?.fulfillmentPercent !== undefined &&
-                  progress.fulfillmentPercent < 100 && (
-                    <div className="mt-1 text-warning">
-                      Below contract value — a reason is required to finalize.
-                    </div>
-                  )}
-              </div>
-            )}
-
-            <Label className="text-xs font-medium text-muted-foreground">
-              FS No (required)
-            </Label>
-
-            <input
-              type="text"
-              value={fsNo}
-              onChange={(e) => setFsNo(e.target.value)}
-              placeholder="e.g. 2704301"
-              className="h-9 rounded-md border border-input bg-popover text-sm"
-            />
-
-            {progress &&
-              closedBelowValue &&
-              progress.fulfillmentPercent < 100 && (
-                <>
-                  <Label className="text-xs font-medium text-muted-foreground">
-                    Reason for shortfall (required)
-                  </Label>
-
-                  <Textarea
-                    value={reason}
-                    onChange={(e) => setReason(e.target.value)}
-                    placeholder="Explain why the contract is being finalized below its value…"
-                    rows={3}
-                    className="resize-y border-input bg-popover text-sm"
-                  />
-                </>
-              )}
-
-            <p className="text-xs text-muted-foreground">
-              Finalizing creates exactly one Sales Invoice for all completed
-              orders. The contract is then invoiced and its orders are frozen.
-            </p>
-          </div>
-
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDialog(null)}
-              disabled={busy}
-              className="border-input"
-            >
-              Cancel
-            </Button>
-
-            <Button
-              onClick={() =>
-                runAction(
-                  () =>
-                    creditContractsRepository.finalizeContract(
-                      contract.id,
-                      {
-                        fsNo: fsNo || "",
-                        reason: reason || undefined,
-                      },
-                    ),
-                  "Credit contract finalized",
-                )
-              }
-              disabled={
-                !fsNo.trim() ||
-                (
-                  closedBelowValue &&
-                  progress?.fulfillmentPercent !== undefined &&
-                  progress.fulfillmentPercent < 100 &&
-                  !reason.trim()
-                ) ||
-                busy
-              }
-              className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
-            >
-              {busy ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" />
-                  Finalizing…
-                </>
-              ) : (
-                "Finalize"
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Payment information dialog */}
-      {isFinance && financialOpen && report && (
-        <ContractPaymentDialog
-          contractId={contract.id}
+      {/* Credit-specific completion dialog */}
+      {isFinance && (
+        <CreditContractPaymentDialog
+          open={paymentOpen}
+          onOpenChange={setPaymentOpen}
           contractNumber={contract.contractNumber}
-          report={report}
-          onClose={() => setFinancialOpen(false)}
-          onSave={async (input) => {
-            await creditContractsRepository.saveFinancialInformation(
-              contract.id,
-              input,
-            );
-          }}
+          customerName={contract.customer.name}
+          creditAmount={financials?.totals.fulfilledValue ?? 0}
+          onComplete={handleCompleteCredit}
         />
       )}
 
-      {/* Edit contract dialog */}
+      {/* Finance: edit draft contract */}
       {isFinance &&
         contract.status === CREDIT_CONTRACT_STATUS.DRAFT && (
           <CreditContractFormDialog
@@ -929,7 +775,7 @@ export default function CreditContractDetail() {
           />
         )}
 
-      {/* Add/Edit order dialog */}
+      {/* Add or edit credit order */}
       {accepted && (
         <CreditOrderDialog
           open={orderDialogOpen}
@@ -942,6 +788,15 @@ export default function CreditContractDetail() {
           initialOrder={editingOrder}
         />
       )}
+
+      {/* Attachment viewer */}
+      <AttachmentViewer
+        evidence={viewingAttachment}
+        open={Boolean(viewingAttachment)}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setViewingAttachment(null);
+        }}
+      />
     </div>
   );
 }

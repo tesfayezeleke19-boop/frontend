@@ -1015,10 +1015,14 @@ class ApiExpensesRepository implements ExpensesRepository {
   }
 
   async createExpense(input: ExpenseInput) {
-    return await financeApi.createExpense({
+    const saved = (await financeApi.createExpense({
       ...this.withFormattedDate(input),
       expenseSource: EXPENSE_SOURCE.FINANCE,
-    }) as Expense;
+    })) as Expense;
+    // The API repository must notify Finance subscribers too, otherwise the
+    // list keeps showing the pre-create snapshot until a manual refresh.
+    notifyFinanceChanged();
+    return saved;
   }
 
   /** Convert UI attachment objects into scalar IDs expected by the API. */
@@ -1040,11 +1044,18 @@ class ApiExpensesRepository implements ExpensesRepository {
 
   async createAdminExpense(input: ExpenseInput): Promise<Expense> {
     const payload = this.withAttachmentIds(this.withFormattedDate(input));
-    return await adminExpensesApi.createExpense(payload) as Expense;
+    const saved = (await adminExpensesApi.createExpense(payload)) as Expense;
+    notifyFinanceChanged();
+    return saved;
   }
 
   async updateExpense(id: string, input: Partial<ExpenseInput>) {
-    return await financeApi.updateExpense(id, this.withFormattedDate(input)) as Expense;
+    const saved = (await financeApi.updateExpense(
+      id,
+      this.withFormattedDate(input),
+    )) as Expense;
+    notifyFinanceChanged();
+    return saved;
   }
 
   async updateAdminExpense(
@@ -1052,17 +1063,32 @@ class ApiExpensesRepository implements ExpensesRepository {
     input: Partial<ExpenseInput>,
   ): Promise<Expense> {
     const payload = this.withAttachmentIds(this.withFormattedDate(input));
-    return await adminExpensesApi.updateExpense(id, payload) as Expense;
+    const saved = (await adminExpensesApi.updateExpense(id, payload)) as Expense;
+    notifyFinanceChanged();
+    return saved;
   }
 
   async submitAdminExpense(id: string): Promise<Expense> {
     // The backend validates and performs the status transition.
-    return await adminExpensesApi.submitExpense(id) as Expense;
+    const saved = (await adminExpensesApi.submitExpense(id)) as Expense;
+    notifyFinanceChanged();
+    return saved;
   }
 
-  async approveAdminExpense(id: string) { return await financeApi.approveExpense(id) as Expense; }
-  async rejectAdminExpense(id: string, reason: string) { return await financeApi.rejectExpense(id, reason) as Expense; }
-  async deleteExpense(id: string) { await financeApi.deleteExpense(id); }
+  async approveAdminExpense(id: string) {
+    const saved = (await financeApi.approveExpense(id)) as Expense;
+    notifyFinanceChanged();
+    return saved;
+  }
+  async rejectAdminExpense(id: string, reason: string) {
+    const saved = (await financeApi.rejectExpense(id, reason)) as Expense;
+    notifyFinanceChanged();
+    return saved;
+  }
+  async deleteExpense(id: string) {
+    await financeApi.deleteExpense(id);
+    notifyFinanceChanged();
+  }
   subscribe(listener: () => void) { return subscribeFinance(listener); }
 }
 

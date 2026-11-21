@@ -59,7 +59,8 @@ export interface ContractPaymentInput {
   paymentAmount: number;
   paymentDate?: number;
   paymentReferenceNumber: string;
-  paymentEvidence?: FileEvidence;
+  /** `undefined` leaves existing evidence; `null` explicitly removes it. */
+  paymentEvidence?: FileEvidence | null;
   remark?: string;
 }
 
@@ -78,7 +79,8 @@ export interface ContractWithholdingInformation {
 
 export interface ContractWithholdingInput {
   enabled: boolean;
-  evidence?: FileEvidence;
+  /** `undefined` leaves existing evidence; `null` explicitly removes it. */
+  evidence?: FileEvidence | null;
 }
 
 /**
@@ -92,6 +94,67 @@ export interface ContractFinancialInput {
 }
 
 export const WITHHOLDING_RATE_LABEL = `${Math.round(WITHHOLDING_RATE * 100)}%`;
+
+/**
+ * Normalize a stored payment timestamp to its local calendar day. Existing
+ * records may contain noon timestamps from an older entry path; comparison
+ * must treat the same calendar date as unchanged.
+ */
+export function normalizePaymentDate(
+  value?: number | null,
+): number | undefined {
+  if (value == null || !Number.isFinite(value)) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return new Date(
+    date.getFullYear(),
+    date.getMonth(),
+    date.getDate(),
+  ).getTime();
+}
+
+/** Parse the shared `YYYY-MM-DD` payment-date input into a local date. */
+export function parsePaymentDateInput(value: string): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const date = new Date(`${trimmed}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? undefined : date.getTime();
+}
+
+/** Format a stored payment timestamp back into the shared date input. */
+export function formatPaymentDateInput(value?: number): string {
+  if (value == null || !Number.isFinite(value)) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * Meaningful payment change detection used by every save path. Strings are
+ * trimmed, amounts are normalized, dates are compared by calendar day, and
+ * evidence is compared by server attachment id.
+ */
+export function paymentInformationChanged(
+  current: ContractPaymentInformation | undefined,
+  next: ContractPaymentInformation,
+): boolean {
+  if (!current) return true;
+
+  return (
+    current.bank.trim() !== next.bank.trim() ||
+    current.paymentSender.trim() !== next.paymentSender.trim() ||
+    normalizeNumber(current.paymentAmount) !==
+      normalizeNumber(next.paymentAmount) ||
+    (normalizePaymentDate(current.paymentDate) ?? null) !==
+      (normalizePaymentDate(next.paymentDate) ?? null) ||
+    current.paymentReferenceNumber.trim() !==
+      next.paymentReferenceNumber.trim() ||
+    (current.paymentEvidence?.id ?? null) !==
+      (next.paymentEvidence?.id ?? null) ||
+    (current.remark ?? "").trim() !== (next.remark ?? "").trim()
+  );
+}
 
 /* ------------------------------------------------------------------ */
 /* Audit history                                                       */

@@ -50,9 +50,14 @@ const workflowSteps: { key: OrderStatus; label: string }[] = [
 type EvidenceFile = {
   fileName: string;
   fileUrl?: string | null;
+  mimeType?: string | null;
 };
 
-function isImageFile(fileName: string) {
+function isImageFile(fileName: string, mimeType?: string | null) {
+  if (mimeType?.toLowerCase().startsWith("image/")) {
+    return true;
+  }
+
   return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(fileName);
 }
 
@@ -66,7 +71,7 @@ function EvidenceAttachment({
 }) {
   const navigate = useNavigate();
 
-  const imageFile = isImageFile(file.fileName);
+  const imageFile = isImageFile(file.fileName, file.mimeType);
   const fileUrl = file.fileUrl;
 
 

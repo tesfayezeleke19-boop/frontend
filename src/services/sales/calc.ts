@@ -1,3 +1,4 @@
+
 import type { SalesOrder } from "./types";
 
 /**
@@ -7,24 +8,38 @@ import type { SalesOrder } from "./types";
  */
 export function normalizeNumber(value: unknown): number {
   if (value === undefined || value === null || value === "") return 0;
+
   if (typeof value === "number") {
     return Number.isFinite(value) ? value : 0;
   }
+
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed === "") return 0;
+
     const parsed = Number(trimmed);
     return Number.isFinite(parsed) ? parsed : 0;
   }
+
   return 0;
 }
 
 /**
- * Round to 2 decimal places to avoid floating point noise.
+ * Round monetary values to 2 decimal places.
+ * EPSILON helps compensate for JavaScript floating-point precision.
  */
 export function roundMoney(value: number): number {
   const safe = normalizeNumber(value);
   return Math.round((safe + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * Round a calculated value to 6 decimal places.
+ * Useful for quantities and intermediate calculations.
+ */
+export function roundCalculation(value: number): number {
+  const safe = normalizeNumber(value);
+  return Math.round((safe + Number.EPSILON) * 1_000_000) / 1_000_000;
 }
 
 /**
@@ -35,29 +50,35 @@ export const VAT_DIVISOR = 1.15;
 /**
  * Calculate VAT-exclusive total price.
  *
- *   totalPriceExclVat = unitPrice × quantity
+ * totalPriceExclVat = unitPrice × quantity
  *
- * Used by the Royalty Report "Total Price" column.
+ * Round the final monetary amount to 2 decimal places.
  */
 export function calculateTotalPriceExclVat(
   unitPrice: number,
   quantity: number,
 ): number {
-  return roundMoney(unitPrice * quantity);
+  const safeUnitPrice = normalizeNumber(unitPrice);
+  const safeQuantity = normalizeNumber(quantity);
+
+  return roundMoney(safeUnitPrice * safeQuantity);
 }
 
 /**
  * Calculate VAT-inclusive total price.
  *
- *   totalPriceInclVat = (unitPrice × 1.15) × quantity
+ * totalPriceInclVat = (unitPrice × quantity) × 1.15
  *
- * Used by the Sales New Order "Total Price" field and Finance revenue totals.
+ * First calculate and round the VAT-exclusive amount, then apply VAT.
+ * This avoids floating-point noise accumulating in the calculation.
  */
 export function calculateTotalPriceInclVat(
   unitPrice: number,
   quantity: number,
 ): number {
-  return roundMoney(unitPrice * VAT_DIVISOR * quantity);
+  const subtotal = calculateTotalPriceExclVat(unitPrice, quantity);
+
+  return roundMoney(subtotal * VAT_DIVISOR);
 }
 
 /**
@@ -78,12 +99,15 @@ export function calculateTotalPrice(
  */
 export function computeNextOrderNumber(orders: SalesOrder[]): string {
   let max = 0;
+
   for (const order of orders) {
     const match = /^ORDER-(\d+)$/.exec(order.orderNumber);
+
     if (match) {
       max = Math.max(max, parseInt(match[1], 10));
     }
   }
+
   return `ORDER-${String(max + 1).padStart(4, "0")}`;
 }
 
@@ -96,11 +120,14 @@ export function computeNextReportNumber(
   reportNumbers: string[],
 ): string {
   let max = 0;
+
   for (const reportNumber of reportNumbers) {
     const match = /^(?:SALES-REPORT|SR)-(\d+)$/.exec(reportNumber);
+
     if (match) {
       max = Math.max(max, parseInt(match[1], 10));
     }
   }
+
   return `SALES-REPORT-${String(max + 1).padStart(4, "0")}`;
 }

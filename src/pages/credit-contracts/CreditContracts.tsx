@@ -1,19 +1,25 @@
 
-/** Credit Contracts — shared list page (Finance and Sales).
+/** 
+ * Credit Contracts — shared list page (Finance and Sales).
+ *
+ * Finance creates, activates, and completes credit contracts.
+ * Sales creates orders against active credit contracts.
+ *
+ * Every credit contract order is registered immediately as a Sales Invoice.
+ * The FS number is assigned to the related invoices only after Finance
+ * completes the credit contract payment.
+ *
+ * All records are loaded and persisted through the backend API.
+ * No localStorage is used.
+ */
 
-This is the ADDITIONAL workflow that sits beside the existing Contract Orders
-module. It has its own numbers (CREDIT-0001), its own statuses, and its own
-storage keys — it never reads, writes, or reinterprets standard contracts.
-
-Finance creates, activates, cancels, and finalizes credit contracts here.
-Any authorized Sales user sees every active contract and can add orders to
-any of them — no assignment, no ownership restriction, no fixed order limit.
-*/
 import { useMemo, useState } from "react";
 import { Link, useLocation } from "react-router";
+
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+
 import {
   Select,
   SelectContent,
@@ -21,6 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+
 import {
   Search,
   ScrollText,
@@ -30,41 +37,29 @@ import {
   Info,
 } from "lucide-react";
 
-import { EthiopianDatePicker } from "@/components/ui/ethiopian-date-picker";
 import { useAuth } from "@/hooks/use-auth";
 import { USER_ROLES } from "@/services/auth";
+
 import {
   useCreditContracts,
   useAllCreditContractOrders,
 } from "@/hooks/use-credit-contracts-data";
+
 import {
   CREDIT_CONTRACT_STATUS,
   CREDIT_CONTRACT_STATUS_LABELS,
   CREDIT_CONTRACT_STATUS_UI,
-  getCreditContractProgress,
+  getCreditContractTotals,
   type CreditContract,
   type CreditContractOrder,
 } from "@/services/creditContracts/types";
-import { formatCurrency } from "@/services/sales/format";
+
+import {
+  formatCurrency,
+  formatDate,
+} from "@/services/sales/format";
+
 import { CreditContractFormDialog } from "@/components/credit-contracts/CreditContractFormDialog";
-import { CreditOrderDialog } from "@/components/credit-contracts/CreditOrderDialog";
-
-/**
- * API timestamps are kept in their existing format.
- * The picker returns Gregorian YYYY-MM-DD values, so filtering compares
- * Gregorian calendar-day keys without changing the underlying dates.
- */
-function getLocalDateKey(timestamp: number): string {
-  const date = new Date(timestamp);
-
-  if (Number.isNaN(date.getTime())) return "";
-
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
-}
 
 function matchesDateRange(
   timestamp: number,
@@ -73,42 +68,16 @@ function matchesDateRange(
 ): boolean {
   if (!from && !to) return true;
 
-  const dateKey = getLocalDateKey(timestamp);
+  const date = new Date(timestamp);
 
-  if (!dateKey) return false;
-  if (from && dateKey < from) return false;
-  if (to && dateKey > to) return false;
+  const iso = `${date.getFullYear()}-${String(
+    date.getMonth() + 1,
+  ).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+  if (from && iso < from) return false;
+  if (to && iso > to) return false;
 
   return true;
-}
-
-/**
- * Display an existing date value using the Ethiopian calendar.
- * No change is made to the original date or backend value.
- */
-function formatEthiopianDate(
-  value: number | string | null | undefined,
-): string {
-  if (value === null || value === undefined || value === "") {
-    return "—";
-  }
-
-  const date =
-    typeof value === "number"
-      ? new Date(value)
-      : new Date(
-          /^\d{4}-\d{2}-\d{2}$/.test(value)
-            ? `${value}T12:00:00`
-            : value,
-        );
-
-  if (Number.isNaN(date.getTime())) return "—";
-
-  return new Intl.DateTimeFormat("en-ET-u-ca-ethiopic-nu-latn", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  }).format(date);
 }
 
 export default function CreditContracts() {
@@ -116,22 +85,26 @@ export default function CreditContracts() {
   const { user } = useAuth();
 
   const isFinance = user?.role === USER_ROLES.FINANCE;
+  const isSales = user?.role === USER_ROLES.SALES;
 
   const portalBase = location.pathname.startsWith("/finance")
     ? "/finance"
     : "/sales";
 
-  const { data: contracts, loading } = useCreditContracts();
-  const { data: orders } = useAllCreditContractOrders();
+  const {
+    data: contracts,
+    loading,
+  } = useCreditContracts();
+
+  const {
+    data: orders,
+  } = useAllCreditContractOrders();
 
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<string>("ALL");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [formOpen, setFormOpen] = useState(false);
-  const [orderDialogOpen, setOrderDialogOpen] = useState(false);
-  const [selectedContract, setSelectedContract] =
-    useState<CreditContract | null>(null);
 
   const ordersByContract = useMemo(() => {
     const map = new Map<string, CreditContractOrder[]>();
@@ -167,29 +140,27 @@ export default function CreditContracts() {
         contract.contractNumber.toLowerCase().includes(term) ||
         contract.customer.name.toLowerCase().includes(term) ||
         contract.customer.tin.toLowerCase().includes(term) ||
-        contract.fsNo.toLowerCase().includes(term)
+        (contract.fsNo ?? "").toLowerCase().includes(term)
       );
     });
   }, [contracts, status, search, from, to]);
 
   const totals = useMemo(() => {
-    let contractValue = 0;
-    let fulfilled = 0;
+    let accumulated = 0;
+    let royaltyBase = 0;
     let active = 0;
-    let orderCount = 0;
+    let completedOrders = 0;
 
     for (const contract of contracts ?? []) {
       const contractOrders =
         ordersByContract.get(contract.id) ?? [];
 
-      const progress = getCreditContractProgress(
-        contract,
-        contractOrders,
-      );
+      const contractTotals =
+        getCreditContractTotals(contractOrders);
 
-      contractValue += progress.contractValue;
-      fulfilled += progress.fulfilledValue;
-      orderCount += contractOrders.length;
+      accumulated += contractTotals.fulfilledValue;
+      royaltyBase += contractTotals.royaltyBase;
+      completedOrders += contractTotals.completedOrderCount;
 
       if (contract.status === CREDIT_CONTRACT_STATUS.ACTIVE) {
         active += 1;
@@ -197,10 +168,10 @@ export default function CreditContracts() {
     }
 
     return {
-      contractValue,
-      fulfilled,
+      accumulated,
+      royaltyBase,
       active,
-      orderCount,
+      completedOrders,
     };
   }, [contracts, ordersByContract]);
 
@@ -216,14 +187,14 @@ export default function CreditContracts() {
       icon: TrendingUp,
     },
     {
-      label: "Total Contract Value",
-      value: formatCurrency(totals.contractValue),
-      icon: FileText,
+      label: "Accumulated Order Value",
+      value: formatCurrency(totals.accumulated),
+      icon: CreditCard,
     },
     {
-      label: "Fulfilled Value",
-      value: formatCurrency(totals.fulfilled),
-      icon: CreditCard,
+      label: "Completed Orders",
+      value: String(totals.completedOrders),
+      icon: FileText,
     },
   ];
 
@@ -231,8 +202,8 @@ export default function CreditContracts() {
     return (
       <div className="flex items-center justify-center py-20">
         <div
-          className="animate-spin text-muted-foreground/70"
-          aria-hidden="true"
+          className="size-6 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-primary"
+          aria-label="Loading credit contracts"
         />
       </div>
     );
@@ -240,7 +211,7 @@ export default function CreditContracts() {
 
   return (
     <div className="space-y-5">
-      {/* Header */}
+      {/* Page heading */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="font-heading text-2xl font-semibold text-foreground">
@@ -259,8 +230,7 @@ export default function CreditContracts() {
         )}
       </div>
 
-      {/* Sales information */}
-      
+  
 
       {/* Statistics */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -299,13 +269,18 @@ export default function CreditContracts() {
           />
         </div>
 
-        <Select value={status} onValueChange={setStatus}>
+        <Select
+          value={status}
+          onValueChange={setStatus}
+        >
           <SelectTrigger className="h-9 w-48 border-input bg-popover text-sm text-foreground">
             <SelectValue />
           </SelectTrigger>
 
           <SelectContent className="border-input bg-popover">
-            <SelectItem value="ALL">All statuses</SelectItem>
+            <SelectItem value="ALL">
+              All statuses
+            </SelectItem>
 
             {Object.values(CREDIT_CONTRACT_STATUS).map((value) => (
               <SelectItem key={value} value={value}>
@@ -315,41 +290,31 @@ export default function CreditContracts() {
           </SelectContent>
         </Select>
 
-        {/* Ethiopian date filters */}
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="w-44">
-            <EthiopianDatePicker
+        <div className="flex items-center gap-2">
+          <div className="w-40">
+            <input
+              type="date"
               value={from}
-              onChange={setFrom}
-              placeholder="From date"
+              onChange={(e) => setFrom(e.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-popover px-2 text-sm text-foreground"
+              aria-label="From date"
             />
           </div>
 
-          <span className="text-xs text-muted-foreground/70">to</span>
+          <span className="text-xs text-muted-foreground/70">
+            to
+          </span>
 
-          <div className="w-44">
-            <EthiopianDatePicker
+          <div className="w-40">
+            <input
+              type="date"
               value={to}
-              onChange={setTo}
-              placeholder="To date"
+              onChange={(e) => setTo(e.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-popover px-2 text-sm text-foreground"
+              aria-label="To date"
             />
           </div>
         </div>
-
-        {(from || to) && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setFrom("");
-              setTo("");
-            }}
-            className="h-9 text-xs text-muted-foreground"
-          >
-            Clear dates
-          </Button>
-        )}
       </div>
 
       {/* Contract table */}
@@ -373,19 +338,15 @@ export default function CreditContracts() {
                     </th>
 
                     <th className="px-4 py-2.5 text-right font-medium">
-                      Contract Value
-                    </th>
-
-                    <th className="px-4 py-2.5 text-right font-medium">
-                      Fulfilled
-                    </th>
-
-                    <th className="px-4 py-2.5 text-right font-medium">
-                      Remaining
-                    </th>
-
-                    <th className="px-4 py-2.5 text-right font-medium">
                       Orders
+                    </th>
+
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Order Value (incl. VAT)
+                    </th>
+
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Royalty Base (excl. VAT)
                     </th>
 
                     <th className="px-4 py-2.5 font-medium">
@@ -403,10 +364,8 @@ export default function CreditContracts() {
                     const contractOrders =
                       ordersByContract.get(contract.id) ?? [];
 
-                    const progress = getCreditContractProgress(
-                      contract,
-                      contractOrders,
-                    );
+                    const contractTotals =
+                      getCreditContractTotals(contractOrders);
 
                     return (
                       <tr
@@ -430,24 +389,20 @@ export default function CreditContracts() {
                           {contract.fsNo || "—"}
                         </td>
 
-                        <td className="px-4 py-2.5 text-right tabular-nums text-foreground">
-                          {formatCurrency(progress.contractValue)}
+                        <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
+                          {contractTotals.orderCount}
                         </td>
 
                         <td className="px-4 py-2.5 text-right tabular-nums text-foreground">
-                          {formatCurrency(progress.fulfilledValue)}
+                          {formatCurrency(contractTotals.fulfilledValue)}
                         </td>
 
                         <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
-                          {formatCurrency(progress.remainingValue)}
-                        </td>
-
-                        <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
-                          {contractOrders.length}
+                          {formatCurrency(contractTotals.royaltyBase)}
                         </td>
 
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                          {formatEthiopianDate(contract.contractDate)}
+                          {formatDate(contract.contractDate)}
                         </td>
 
                         <td className="px-4 py-2.5">
@@ -485,25 +440,12 @@ export default function CreditContracts() {
         </CardContent>
       </Card>
 
-      {/* New contract dialog */}
+      {/* Finance: create credit contract */}
       {isFinance && (
         <CreditContractFormDialog
           open={formOpen}
           onOpenChange={setFormOpen}
           onSaved={() => undefined}
-        />
-      )}
-
-      {/* Order dialog */}
-      {(isFinance || (!isFinance && user?.role === USER_ROLES.SALES)) && (
-        <CreditOrderDialog
-          open={orderDialogOpen}
-          onOpenChange={setOrderDialogOpen}
-          contract={selectedContract}
-          onSaved={() => {
-            setSelectedContract(null);
-            setOrderDialogOpen(false);
-          }}
         />
       )}
     </div>

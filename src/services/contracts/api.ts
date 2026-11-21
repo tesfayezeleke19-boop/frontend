@@ -13,7 +13,8 @@ import type {
 } from "./financials";
 
 const API_BASE = (
-  import.meta.env.VITE_API_BASE_URL || "https://backend-production-ac8a256f.up.railway.app"
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://backend-production-ac8a256f.up.railway.app"
 ).replace(/\/+$/, "");
 
 const ROOT = `${API_BASE}/api/contracts`;
@@ -25,16 +26,21 @@ function toEpoch(value: unknown): number {
   if (!value) return 0;
 
   const text = String(value);
+
   const date = /^\d{4}-\d{2}-\d{2}$/.test(text)
     ? new Date(`${text}T12:00:00`)
     : new Date(text);
 
   const result = date.getTime();
+
   return Number.isFinite(result) ? result : 0;
 }
 
 function toDateString(value: unknown): string {
-  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+  if (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(value)
+  ) {
     return value;
   }
 
@@ -55,6 +61,7 @@ function toDateString(value: unknown): string {
 
 function numberValue(value: unknown): number {
   const result = Number(value ?? 0);
+
   return Number.isFinite(result) ? result : 0;
 }
 
@@ -62,33 +69,52 @@ function stringValue(value: unknown): string {
   return value == null ? "" : String(value);
 }
 
+function optionalString(value: unknown): string | undefined {
+  return value == null || value === ""
+    ? undefined
+    : String(value);
+}
+
 function optionalEpoch(value: unknown): number | undefined {
   if (value == null || value === "") return undefined;
 
   const result = toEpoch(value);
+
   return result || undefined;
 }
+
+/* ------------------------------------------------------------------ */
+/* Status normalization                                                */
+/* ------------------------------------------------------------------ */
 
 function normalizeStatus(value: unknown): Contract["status"] {
   const status = String(value ?? "").toUpperCase();
 
-  if (status === "ACTIVE") return "IN_PROGRESS";
-  if (status === "COMPLETED") return "READY_FOR_COMPLETION";
-
-  if (
-    status === "DRAFT" ||
-    status === "IN_PROGRESS" ||
-    status === "READY_FOR_COMPLETION" ||
-    status === "CONVERTED" ||
-    status === "CANCELLED"
-  ) {
-    return status;
-  }
+  if (status === "DRAFT") return "DRAFT";
+  if (status === "ACTIVE") return "ACTIVE";
+  if (status === "COMPLETED") return "COMPLETED";
 
   return "DRAFT";
 }
 
-function mapAttachment(row: ApiRecord): Contract["attachments"][number] {
+function normalizeOrderStatus(
+  value: unknown,
+): ContractOrder["status"] {
+  const status = String(value ?? "").toUpperCase();
+
+  if (status === "PENDING") return "PENDING";
+  if (status === "CANCELLED") return "CANCELLED";
+
+  return "COMPLETED";
+}
+
+/* ------------------------------------------------------------------ */
+/* Attachment mapping                                                  */
+/* ------------------------------------------------------------------ */
+
+function mapAttachment(
+  row: ApiRecord,
+): Contract["attachments"][number] {
   return {
     id: stringValue(row.id),
     fileName: stringValue(row.fileName ?? row.file_name),
@@ -98,54 +124,83 @@ function mapAttachment(row: ApiRecord): Contract["attachments"][number] {
   };
 }
 
-function mapStatusHistory(rows: unknown): Contract["statusHistory"] {
+/* ------------------------------------------------------------------ */
+/* Contract history                                                    */
+/* ------------------------------------------------------------------ */
+
+function mapStatusHistory(
+  rows: unknown,
+): Contract["statusHistory"] {
   if (!Array.isArray(rows)) return [];
 
   return rows.map((row: ApiRecord) => ({
     status: normalizeStatus(row.status),
-    at: toEpoch(row.at ?? row.createdAt ?? row.created_at),
-    by:
+    at: toEpoch(
+      row.at ?? row.createdAt ?? row.created_at,
+    ),
+    by: optionalString(
       row.by ??
       row.changedByName ??
-      row.changed_by_name ??
-      undefined,
-    note: row.note ?? undefined,
+      row.changed_by_name,
+    ),
+    note: optionalString(row.note),
   }));
 }
 
-function mapPayment(row: ApiRecord | null | undefined): Contract["payment"] {
+/* ------------------------------------------------------------------ */
+/* Financial information                                               */
+/* ------------------------------------------------------------------ */
+
+function mapPayment(
+  row: ApiRecord | null | undefined,
+): Contract["payment"] {
   if (!row) return undefined;
 
-  const evidence = row.paymentEvidence ?? row.payment_evidence;
+  const evidence =
+    row.paymentEvidence ?? row.payment_evidence;
 
   return {
-    bank: stringValue(row.bank ?? row.paymentBank ?? row.payment_bank),
+    bank: stringValue(
+      row.bank ?? row.paymentBank ?? row.payment_bank,
+    ),
+
     paymentSender: stringValue(
       row.paymentSender ?? row.payment_sender,
     ),
+
     paymentAmount: numberValue(
       row.paymentAmount ?? row.payment_amount,
     ),
+
     paymentDate: optionalEpoch(
       row.paymentDate ?? row.payment_date,
     ),
+
     paymentReferenceNumber: stringValue(
-      row.paymentReferenceNumber ?? row.payment_reference_number,
+      row.paymentReferenceNumber ??
+      row.payment_reference_number,
     ),
-    paymentEvidence: evidence ? mapAttachment(evidence) : undefined,
-    remark:
+
+    paymentEvidence: evidence
+      ? mapAttachment(evidence)
+      : undefined,
+
+    remark: optionalString(
       row.remark ??
       row.paymentRemark ??
-      row.payment_remark ??
-      undefined,
-    recordedBy:
+      row.payment_remark,
+    ),
+
+    recordedBy: optionalString(
       row.recordedBy ??
       row.paymentRecordedByName ??
-      row.payment_recorded_by_name ??
-      undefined,
+      row.payment_recorded_by_name,
+    ),
+
     recordedAt: optionalEpoch(
       row.recordedAt ?? row.payment_recorded_at,
     ),
+
     updatedAt: optionalEpoch(
       row.updatedAt ?? row.payment_updated_at,
     ),
@@ -168,25 +223,36 @@ function mapWithholding(
       row.withholdingEnabled ??
       row.withholding_enabled,
     ),
+
     rate: numberValue(
       row.rate ??
       row.withholdingRate ??
       row.withholding_rate,
     ),
-    evidence: evidence ? mapAttachment(evidence) : undefined,
-    recordedBy:
+
+    evidence: evidence
+      ? mapAttachment(evidence)
+      : undefined,
+
+    recordedBy: optionalString(
       row.recordedBy ??
       row.withholdingRecordedByName ??
-      row.withholding_recorded_by_name ??
-      undefined,
+      row.withholding_recorded_by_name,
+    ),
+
     recordedAt: optionalEpoch(
       row.recordedAt ?? row.withholding_recorded_at,
     ),
+
     updatedAt: optionalEpoch(
       row.updatedAt ?? row.withholding_updated_at,
     ),
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Contract mapping                                                    */
+/* ------------------------------------------------------------------ */
 
 export function mapContract(row: ApiRecord): Contract {
   const customer = row.customer ?? {};
@@ -201,11 +267,16 @@ export function mapContract(row: ApiRecord): Contract {
     row.financialInformation ??
     row.financial_information;
 
+  const paymentHistory =
+    row.paymentHistory ?? row.payment_history;
+
   return {
     id: stringValue(row.id),
+
     contractNumber: stringValue(
       row.contractNumber ?? row.contract_number,
     ),
+
     customer: {
       name: stringValue(
         customer.name ??
@@ -213,6 +284,7 @@ export function mapContract(row: ApiRecord): Contract {
         row.customer_name ??
         row.customer_name_snapshot,
       ),
+
       tin: stringValue(
         customer.tin ??
         row.customerTin ??
@@ -220,124 +292,118 @@ export function mapContract(row: ApiRecord): Contract {
         row.customer_tin_snapshot,
       ),
     },
+
     contractValue: numberValue(
       row.contractValue ?? row.contract_value,
     ),
-    fsNo: stringValue(row.fsNo ?? row.fs_no),
+
+    fsNo: stringValue(
+      row.fsNo ?? row.fs_no,
+    ),
+
     contractDate: toEpoch(
       row.contractDate ?? row.contract_date,
     ),
+
     attachments: Array.isArray(attachments)
       ? attachments.map(mapAttachment)
       : [],
-    remark: row.remark ?? undefined,
+
+    remark: optionalString(row.remark),
+
     status: normalizeStatus(row.status),
-    createdBy:
+
+    createdBy: optionalString(
       row.createdBy ??
       row.created_by_name ??
-      row.created_by ??
-      undefined,
-    createdAt: toEpoch(row.createdAt ?? row.created_at),
-    updatedAt: toEpoch(row.updatedAt ?? row.updated_at),
+      row.created_by,
+    ),
+
+    createdAt: toEpoch(
+      row.createdAt ?? row.created_at,
+    ),
+
+    updatedAt: toEpoch(
+      row.updatedAt ?? row.updated_at,
+    ),
+
     activatedAt: optionalEpoch(
       row.activatedAt ?? row.activated_at,
     ),
-    activatedBy:
+
+    activatedBy: optionalString(
       row.activatedBy ??
       row.activated_by_name ??
-      row.activated_by ??
-      undefined,
-    readyAt: optionalEpoch(row.readyAt ?? row.ready_at),
+      row.activated_by,
+    ),
+
     completionConfirmedAt: optionalEpoch(
       row.completionConfirmedAt ??
       row.completion_confirmed_at,
     ),
-    completionConfirmedBy:
+
+    completionConfirmedBy: optionalString(
       row.completionConfirmedBy ??
       row.completion_confirmed_by_name ??
-      row.completion_confirmed_by ??
-      undefined,
-    completionReason:
-      row.completionReason ??
-      row.completion_reason ??
-      undefined,
-    closedBelowValue: Boolean(
-      row.closedBelowValue ?? row.closed_below_value,
+      row.completion_confirmed_by,
     ),
+
+    completionReason: optionalString(
+      row.completionReason ??
+      row.completion_reason,
+    ),
+
+    closedBelowValue: Boolean(
+      row.closedBelowValue ??
+      row.closed_below_value,
+    ),
+
     payment: mapPayment(
       row.payment ?? financialInformation,
     ),
+
     withholding: mapWithholding(
       row.withholding ?? financialInformation,
     ),
-    paymentHistory: Array.isArray(
-      row.paymentHistory ?? row.payment_history,
-    )
-      ? (row.paymentHistory ?? row.payment_history).map(
-          (item: ApiRecord) => ({
-            action: item.action,
-            at: toEpoch(
-              item.at ?? item.createdAt ?? item.created_at,
-            ),
-            by:
-              item.by ??
-              item.changedByName ??
-              item.changed_by_name ??
-              item.changed_by ??
-              "",
-            note: item.note ?? undefined,
-          }),
-        )
+
+    paymentHistory: Array.isArray(paymentHistory)
+      ? paymentHistory.map((item: ApiRecord) => ({
+          action: item.action,
+          at: toEpoch(
+            item.at ??
+            item.createdAt ??
+            item.created_at,
+          ),
+          by: stringValue(
+            item.by ??
+            item.changedByName ??
+            item.changed_by_name ??
+            item.changed_by,
+          ),
+          note: optionalString(item.note),
+        }))
       : [],
-    cancelledAt: optionalEpoch(
-      row.cancelledAt ?? row.cancelled_at,
-    ),
-    cancelledBy:
-      row.cancelledBy ??
-      row.cancelled_by_name ??
-      row.cancelled_by ??
-      undefined,
-    cancellationReason:
-      row.cancellationReason ??
-      row.cancellation_reason ??
-      undefined,
-    salesInvoiceId:
-      row.salesInvoiceId ??
-      row.sales_invoice_id ??
-      undefined,
-    salesInvoiceNumber:
-      row.salesInvoiceNumber ??
-      row.sales_invoice_number ??
-      undefined,
-    convertedAt: optionalEpoch(
-      row.convertedAt ?? row.converted_at,
-    ),
-    convertedBy:
-      row.convertedBy ??
-      row.converted_by_name ??
-      row.converted_by ??
-      undefined,
-    conversionStartedAt: optionalEpoch(
-      row.conversionStartedAt ??
-      row.conversion_started_at,
-    ),
-    conversionError:
-      row.conversionError ??
-      row.conversion_error ??
-      undefined,
+
     statusHistory: mapStatusHistory(
       row.statusHistory ?? row.status_history,
     ),
   };
 }
 
-export function mapContractOrder(row: ApiRecord): ContractOrder {
+/* ------------------------------------------------------------------ */
+/* Contract order mapping                                              */
+/* ------------------------------------------------------------------ */
+
+export function mapContractOrder(
+  row: ApiRecord,
+): ContractOrder {
   const quantity = numberValue(row.quantity);
+
   const unitPrice = numberValue(
     row.unitPrice ?? row.unit_price,
   );
 
-  const excl = numberValue(
+  const lineTotalExclVat = numberValue(
     row.lineTotalExclVat ??
     row.line_total_excl_vat ??
     quantity * unitPrice,
@@ -349,100 +415,129 @@ export function mapContractOrder(row: ApiRecord): ContractOrder {
 
   return {
     id: stringValue(row.id),
+
     contractId: stringValue(
       row.contractId ?? row.contract_id,
     ),
+
     orderNumber: numberValue(
       row.orderNumber ?? row.order_number,
     ),
 
-    // Preserve the aggregate code as a string, including values like "00".
-    aggregate: stringValue(row.aggregate) as ContractOrder["aggregate"],
+    // Keep aggregate codes as strings, including "00".
+    aggregate: stringValue(
+      row.aggregate,
+    ) as ContractOrder["aggregate"],
 
     quantity,
-    unit: stringValue(row.unit ?? "m³"),
+
+    unit: stringValue(
+      row.unit ?? "m³",
+    ),
+
     unitPrice,
-    lineTotalExclVat: excl,
+
+    lineTotalExclVat,
+
     lineTotalInclVat: numberValue(
       row.lineTotalInclVat ??
       row.line_total_incl_vat ??
-      excl * 1.15,
+      lineTotalExclVat * 1.15,
     ),
+
     royaltyInvoiceNumber: stringValue(
       row.royaltyInvoiceNumber ??
       row.royalty_invoice_number,
     ),
+
     orderDate: toEpoch(
       row.orderDate ?? row.order_date,
     ),
-    status:
-      String(row.status ?? "COMPLETED").toUpperCase() === "CANCELLED"
-        ? "CANCELLED"
-        : "COMPLETED",
-    completedByUserId:
+
+    // Preserve all three order lifecycle statuses.
+    status: normalizeOrderStatus(row.status),
+
+    completedByUserId: stringValue(
       row.completedByUserId ??
-      row.completed_by ??
-      undefined,
-    completedByName:
+      row.completed_by,
+    ),
+
+    completedByName: stringValue(
       row.completedByName ??
-      row.completed_by_name ??
-      undefined,
-    completedByEmail:
+      row.completed_by_name,
+    ),
+
+    completedByEmail: optionalString(
       row.completedByEmail ??
-      row.completed_by_email ??
-      undefined,
+      row.completed_by_email,
+    ),
 
-    // The frontend type requires a number. Use creation time if the
-    // backend has no completion timestamp for this record.
-    completedAt:
-      optionalEpoch(row.completedAt ?? row.completed_at) ?? createdAt,
+    // Pending orders have no completion timestamp.
+    completedAt: toEpoch(
+      row.completedAt ?? row.completed_at,
+    ),
 
-    createdByUserId:
+    createdByUserId: stringValue(
       row.createdByUserId ??
-      row.created_by ??
-      undefined,
-    createdByName:
+      row.created_by,
+    ),
+
+    createdByName: stringValue(
       row.createdByName ??
-      row.created_by_name ??
-      undefined,
+      row.created_by_name,
+    ),
+
     createdAt,
+
     updatedAt: toEpoch(
       row.updatedAt ?? row.updated_at,
     ),
-    lastEditedByUserId:
+
+    lastEditedByUserId: optionalString(
       row.lastEditedByUserId ??
-      row.last_edited_by ??
-      undefined,
-    lastEditedByName:
+      row.last_edited_by,
+    ),
+
+    lastEditedByName: optionalString(
       row.lastEditedByName ??
-      row.last_edited_by_name ??
-      undefined,
-    lastEditedByEmail:
+      row.last_edited_by_name,
+    ),
+
+    lastEditedByEmail: optionalString(
       row.lastEditedByEmail ??
-      row.last_edited_by_email ??
-      undefined,
+      row.last_edited_by_email,
+    ),
+
     editedAt: optionalEpoch(
       row.editedAt ?? row.edited_at,
     ),
+
     cancelledAt: optionalEpoch(
       row.cancelledAt ?? row.cancelled_at,
     ),
-    cancelledBy:
+
+    cancelledBy: optionalString(
       row.cancelledBy ??
       row.cancelled_by_name ??
-      row.cancelled_by ??
-      undefined,
-    cancelReason:
+      row.cancelled_by,
+    ),
+
+    cancelReason: optionalString(
       row.cancelReason ??
       row.cancellationReason ??
-      row.cancellation_reason ??
-      undefined,
+      row.cancellation_reason,
+    ),
+
     royaltySourceKey: stringValue(
       row.royaltySourceKey ??
       `contract-order:${row.id}`,
     ),
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* API response handling                                               */
+/* ------------------------------------------------------------------ */
 
 function extractData<T>(payload: any): T {
   if (payload && payload.success === false) {
@@ -459,12 +554,18 @@ async function request<T>(
   options: RequestInit = {},
 ): Promise<T> {
   const token = authRepository.getSession()?.token;
-  const headers = new Headers(options.headers ?? {});
+
+  const headers = new Headers(
+    options.headers ?? {},
+  );
 
   headers.set("Accept", "application/json");
 
   if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+    headers.set(
+      "Authorization",
+      `Bearer ${token}`,
+    );
   }
 
   const isFormData =
@@ -476,7 +577,10 @@ async function request<T>(
     !isFormData &&
     !headers.has("Content-Type")
   ) {
-    headers.set("Content-Type", "application/json");
+    headers.set(
+      "Content-Type",
+      "application/json",
+    );
   }
 
   let response: Response;
@@ -493,6 +597,7 @@ async function request<T>(
   }
 
   const raw = await response.text();
+
   let payload: any = null;
 
   if (raw) {
@@ -529,6 +634,10 @@ function jsonBody(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/* ------------------------------------------------------------------ */
+/* List mapping                                                        */
+/* ------------------------------------------------------------------ */
+
 function mapContractList(value: unknown): Contract[] {
   if (!Array.isArray(value)) {
     throw new Error(
@@ -556,6 +665,7 @@ function mapOrderList(value: unknown): ContractOrder[] {
 export const contractsApi = {
   async getContracts(): Promise<Contract[]> {
     const result = await request<unknown>("/");
+
     return mapContractList(result);
   },
 
@@ -567,18 +677,23 @@ export const contractsApi = {
     return mapContract(result);
   },
 
-  async createContract(input: ContractInput): Promise<Contract> {
-    const result = await request<ApiRecord>("/", {
-      method: "POST",
-      body: jsonBody({
-        customerName: input.customerName,
-        customerTin: input.tin,
-        contractValue: input.contractValue,
-        fsNo: input.fsNo,
-        contractDate: toDateString(input.contractDate),
-        remark: input.remark,
-      }),
-    });
+  async createContract(
+    input: ContractInput,
+  ): Promise<Contract> {
+    const result = await request<ApiRecord>(
+      "/",
+      {
+        method: "POST",
+        body: jsonBody({
+          customerName: input.customerName,
+          customerTin: input.tin,
+          contractValue: input.contractValue,
+          fsNo: input.fsNo,
+          contractDate: toDateString(input.contractDate),
+          remark: input.remark,
+        }),
+      },
+    );
 
     return mapContract(result);
   },
@@ -605,7 +720,9 @@ export const contractsApi = {
     return mapContract(result);
   },
 
-  async activateContract(id: string): Promise<Contract> {
+  async activateContract(
+    id: string,
+  ): Promise<Contract> {
     const result = await request<ApiRecord>(
       `/${encodeURIComponent(id)}/activate`,
       {
@@ -617,7 +734,9 @@ export const contractsApi = {
     return mapContract(result);
   },
 
-  async requestCompletion(id: string): Promise<Contract> {
+  async requestCompletion(
+    id: string,
+  ): Promise<Contract> {
     const result = await request<ApiRecord>(
       `/${encodeURIComponent(id)}/request-completion`,
       {
@@ -666,11 +785,16 @@ export const contractsApi = {
   /* ---------------------------------------------------------------- */
 
   async getAllOrders(): Promise<ContractOrder[]> {
-    const result = await request<unknown>("/all-orders");
+    const result = await request<unknown>(
+      "/all-orders",
+    );
+
     return mapOrderList(result);
   },
 
-  async getOrders(contractId: string): Promise<ContractOrder[]> {
+  async getOrders(
+    contractId: string,
+  ): Promise<ContractOrder[]> {
     const result = await request<unknown>(
       `/${encodeURIComponent(contractId)}/orders`,
     );
@@ -786,14 +910,14 @@ export const contractsApi = {
         body: jsonBody({
           payment,
           withholding: {
-  enabled: input.withholding.enabled,
-  rate: input.withholding.enabled ? 0.03 : 0,
-  evidence: input.withholding.evidence
-    ? {
-        id: input.withholding.evidence.id,
-      }
-    : null,
-},
+            enabled: input.withholding.enabled,
+            rate: input.withholding.enabled ? 0.03 : 0,
+            evidence: input.withholding.evidence
+              ? {
+                  id: input.withholding.evidence.id,
+                }
+              : null,
+          },
         }),
       },
     );
@@ -842,7 +966,9 @@ export const contractsApi = {
   /* Conversion handoff                                                */
   /* ---------------------------------------------------------------- */
 
-  async startConversion(contractId: string): Promise<void> {
+  async startConversion(
+    contractId: string,
+  ): Promise<void> {
     await request<void>(
       `/${encodeURIComponent(contractId)}/conversion/start`,
       {

@@ -1,119 +1,99 @@
-
-import { ArrowLeft, ImageOff, Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { ArrowLeft, ImageOff, Loader2 } from "lucide-react";
+import { API_BASE_URL } from "@/lib/api/config";
 import { authRepository } from "@/services/auth/authRepository";
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8080"
+const API_BASE = (
+  API_BASE_URL ||
+  (import.meta as any).env?.VITE_API_BASE_URL ||
+  "http://localhost:8080/api"
 ).replace(/\/+$/, "");
+const API_ROOT = API_BASE.replace(/\/api\/?$/i, "");
 
 export default function EvidenceImageViewer() {
   const searchParams = new URLSearchParams(window.location.search);
-
-  const imageUrl = searchParams.get("src");
+  const imagePath = searchParams.get("src");
   const fileName = searchParams.get("name") || "Evidence image";
 
-  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [imageUrl, setImageUrl] = useState("");
   const [imageError, setImageError] = useState("");
   const [imageLoading, setImageLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
-    let createdObjectUrl: string | null = null;
+    let objectUrl: string | null = null;
 
-    const loadImage = async () => {
+    async function loadImage() {
       setImageLoading(true);
       setImageError("");
-      setObjectUrl(null);
+      setImageUrl("");
 
-      if (!imageUrl) {
+      if (!imagePath) {
         setImageError("No image URL was provided.");
         setImageLoading(false);
         return;
       }
 
+      // Only allow this viewer to request Finance expense attachments.
+      if (!/^\/api\/finance\/expenses\/attachments\/[a-zA-Z0-9-]+$/.test(imagePath)) {
+        setImageError("Invalid attachment URL.");
+        setImageLoading(false);
+        return;
+      }
+
+      const session: any = authRepository.getSession();
+      const token = session?.token || session?.accessToken || session?.access_token;
+
+      if (typeof token !== "string" || !token.trim()) {
+        setImageError("Your session has expired. Please sign in again.");
+        setImageLoading(false);
+        return;
+      }
+
       try {
-        const session = authRepository.getSession();
-
-        if (!session || session.isGuest || !session.token) {
-          throw new Error(
-            "Your session is unavailable. Please sign in again."
-          );
-        }
-
-        // Resolve relative URLs against the backend.
-        const requestUrl = new URL(
-          imageUrl,
-          `${API_BASE_URL}/`
-        );
-
-        // Never send the authentication token to another origin.
-        if (requestUrl.origin !== new URL(API_BASE_URL).origin) {
-          throw new Error("Invalid evidence image URL.");
-        }
-
-        const response = await fetch(requestUrl.toString(), {
+        const response = await fetch(`${API_ROOT}${imagePath}`, {
           method: "GET",
           headers: {
-            Authorization: `Bearer ${session.token}`,
             Accept: "image/*",
+            Authorization: `Bearer ${token.trim()}`,
           },
         });
 
         if (!response.ok) {
-          if (response.status === 401) {
-            throw new Error(
-              "Your session has expired. Please sign in again."
-            );
+          if (response.status === 401 || response.status === 403) {
+            throw new Error("You are not authorized to view this attachment.");
           }
-
-          if (response.status === 403) {
-            throw new Error(
-              "You are not authorized to view this evidence."
-            );
+          if (response.status === 404) {
+            throw new Error("The attachment file could not be found.");
           }
-
-          throw new Error(
-            `Unable to load the image. Server returned HTTP ${response.status}.`
-          );
+          throw new Error(`Unable to load attachment (HTTP ${response.status}).`);
         }
 
         const blob = await response.blob();
-
         if (!blob.type.startsWith("image/")) {
-          throw new Error("The server did not return a valid image.");
+          throw new Error("This attachment is not an image file.");
         }
 
-        createdObjectUrl = URL.createObjectURL(blob);
-
-        if (!cancelled) {
-          setObjectUrl(createdObjectUrl);
-        }
+        objectUrl = URL.createObjectURL(blob);
+        if (!cancelled) setImageUrl(objectUrl);
       } catch (error) {
         if (!cancelled) {
           setImageError(
-            error instanceof Error
-              ? error.message
-              : "Unable to display this image."
+            error instanceof Error ? error.message : "Unable to display this image.",
           );
         }
       } finally {
-        if (!cancelled) {
-          setImageLoading(false);
-        }
+        if (!cancelled) setImageLoading(false);
       }
-    };
+    }
 
     void loadImage();
 
     return () => {
       cancelled = true;
-
-      if (createdObjectUrl) {
-        URL.revokeObjectURL(createdObjectUrl);
-      }
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [imageUrl]);
+  }, [imagePath]);
 
   return (
     <div className="min-h-screen bg-background p-4 text-foreground sm:p-6">
@@ -122,7 +102,7 @@ export default function EvidenceImageViewer() {
           <button
             type="button"
             onClick={() => window.history.back()}
-            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm hover:bg-accent"
+            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm hover:bg-muted"
           >
             <ArrowLeft className="size-4" />
             Back
@@ -137,26 +117,19 @@ export default function EvidenceImageViewer() {
           {imageLoading ? (
             <div className="flex flex-col items-center gap-3 text-muted-foreground">
               <Loader2 className="size-8 animate-spin" />
-              <p className="text-sm">Loading evidence image...</p>
+              <p className="text-sm">Loading attachment...</p>
             </div>
           ) : imageError ? (
             <div className="flex flex-col items-center gap-3 text-center text-muted-foreground">
               <ImageOff className="size-10" />
-              <p>{imageError}</p>
-            </div>
-          ) : objectUrl ? (
-            <div className="flex w-full items-center justify-center">
-              <img
-                src={objectUrl}
-                alt={fileName}
-                className="max-h-[80vh] max-w-full object-contain"
-              />
+              <p className="text-sm">{imageError}</p>
             </div>
           ) : (
-            <div className="flex flex-col items-center gap-3 text-center text-muted-foreground">
-              <ImageOff className="size-10" />
-              <p>Unable to display this image.</p>
-            </div>
+            <img
+              src={imageUrl}
+              alt={fileName}
+              className="max-h-[80vh] max-w-full object-contain"
+            />
           )}
         </div>
       </div>

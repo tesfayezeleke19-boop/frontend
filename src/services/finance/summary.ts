@@ -6,6 +6,7 @@
  *   - Year: Ethiopian calendar year.
  *   - Month: Ethiopian calendar month (1–13).
  *   - null month: all 13 months within the selected year.
+ *   - Missing year/month: current Ethiopian year and month by default.
  *
  * Accounting definitions:
  *   - Total Sales = FINANCE_APPROVED + PAYMENT_CONFIRMED invoices.
@@ -51,7 +52,7 @@ import type {
 } from "./types";
 
 /* ------------------------------------------------------------------ */
-/* Ethiopian calendar helpers                                          */
+/* Ethiopian calendar helpers                                         */
 /* ------------------------------------------------------------------ */
 
 const ETHIOPIAN_MONTHS = [
@@ -98,6 +99,28 @@ function getEthiopianPeriod(date: Date): {
     year,
     month,
     key: `${year}-${String(month).padStart(2, "0")}`,
+  };
+}
+
+/**
+ * Resolve the dashboard period.
+ *
+ * Missing year  -> current Ethiopian year.
+ * Missing month -> current Ethiopian month.
+ * Null month    -> all 13 months of the selected year.
+ */
+function resolveDashboardPeriod(
+  year?: number,
+  month?: number | null,
+): {
+  year: number;
+  month: number | null;
+} {
+  const current = getEthiopianPeriod(new Date());
+
+  return {
+    year: year ?? current.year,
+    month: month === undefined ? current.month : month,
   };
 }
 
@@ -149,16 +172,41 @@ function matchesPeriod(
 }
 
 /**
- * Build the last six Ethiopian months.
+ * Build the Ethiopian month series for the selected dashboard period.
+ *
+ * Specific month: one month.
+ * All months: all 13 months of the selected year.
+ * No selected year: preserve the previous last-six-month behavior.
+ *
  * Missing months are represented by zero.
  */
 function buildMonthSeries(
   byMonth: Record<string, number>,
+  year?: number,
+  month?: number | null,
 ): {
   name: string;
   value: number;
 }[] {
   const series: { name: string; value: number }[] = [];
+
+  if (year !== undefined) {
+    const months =
+      month == null
+        ? Array.from({ length: 13 }, (_, index) => index + 1)
+        : [month];
+
+    for (const selectedMonth of months) {
+      const key = `${year}-${String(selectedMonth).padStart(2, "0")}`;
+
+      series.push({
+        name: `${ETHIOPIAN_MONTHS[selectedMonth - 1]} ${year}`,
+        value: byMonth[key] ?? 0,
+      });
+    }
+
+    return series;
+  }
 
   const current = getEthiopianPeriod(new Date());
   const currentIndex = current.year * 13 + current.month - 1;
@@ -166,13 +214,13 @@ function buildMonthSeries(
   for (let i = 5; i >= 0; i--) {
     const index = currentIndex - i;
 
-    const year = Math.floor(index / 13);
-    const month = (index % 13) + 1;
+    const selectedYear = Math.floor(index / 13);
+    const selectedMonth = (index % 13) + 1;
 
-    const key = `${year}-${String(month).padStart(2, "0")}`;
+    const key = `${selectedYear}-${String(selectedMonth).padStart(2, "0")}`;
 
     series.push({
-      name: `${ETHIOPIAN_MONTHS[month - 1]} ${year}`,
+      name: `${ETHIOPIAN_MONTHS[selectedMonth - 1]} ${selectedYear}`,
       value: byMonth[key] ?? 0,
     });
   }
@@ -181,7 +229,7 @@ function buildMonthSeries(
 }
 
 /* ------------------------------------------------------------------ */
-/* Revenue helpers                                                      */
+/* Revenue helpers                                                     */
 /* ------------------------------------------------------------------ */
 
 function isRevenueStatus(invoice: SalesInvoice): boolean {
@@ -241,7 +289,7 @@ function invoiceRoyalty(invoices: SalesInvoice[]): number {
 }
 
 /* ------------------------------------------------------------------ */
-/* Grouping helpers                                                     */
+/* Grouping helpers                                                    */
 /* ------------------------------------------------------------------ */
 
 function groupBy(
@@ -269,13 +317,16 @@ function groupBy(
 }
 
 /* ------------------------------------------------------------------ */
-/* Finance dashboard summary                                            */
+/* Finance dashboard summary                                          */
 /* ------------------------------------------------------------------ */
 
 export async function getFinanceSummary(
   year?: number,
   month?: number | null,
 ): Promise<FinanceSummary> {
+  // Default to the current Ethiopian year and month.
+  const period = resolveDashboardPeriod(year, month);
+
   const [allInvoices, allExpenses] = await Promise.all([
     salesInvoicesRepository.getInvoices(),
     expensesRepository.getExpenses(),
@@ -286,14 +337,17 @@ export async function getFinanceSummary(
   /* -------------------------------------------------------------- */
 
   /**
-   * IMPORTANT:
-   * All sales statuses are first filtered by invoice.createdAt.
+   * All sales statuses are filtered using invoice.createdAt.
    *
-   * This prevents approved and payment-confirmed invoices from
-   * being included in different Ethiopian reporting periods.
+   * This ensures approved and payment-confirmed invoices are
+   * included in the same Ethiopian reporting period.
    */
   const invoices = allInvoices.filter((invoice) =>
-    matchesPeriod(invoice.createdAt, year, month),
+    matchesPeriod(
+      invoice.createdAt,
+      period.year,
+      period.month,
+    ),
   );
 
   /**
@@ -307,15 +361,15 @@ export async function getFinanceSummary(
 
   /**
    * Payment activity is separate from sales reporting.
-   * Here, payment confirmation date determines the period.
+   * Payment confirmation date determines its reporting period.
    */
   const confirmedPayments = allInvoices.filter(
     (invoice) =>
       invoice.status === ORDER_STATUS.PAYMENT_CONFIRMED &&
       matchesPeriod(
         invoice.paymentConfirmedAt ?? invoice.createdAt,
-        year,
-        month,
+        period.year,
+        period.month,
       ),
   );
 
@@ -323,7 +377,11 @@ export async function getFinanceSummary(
   const expenses = allExpenses
     .filter(isExpenseCounted)
     .filter((expense) =>
-      matchesPeriod(expense.date, year, month),
+      matchesPeriod(
+        expense.date,
+        period.year,
+        period.month,
+      ),
     );
 
   /* -------------------------------------------------------------- */
@@ -380,17 +438,11 @@ export async function getFinanceSummary(
       invoice.status === ORDER_STATUS.REJECTED,
   );
 
-  // Revenue invoices already contain both approved and confirmed sales.
-  const confirmedSales = revenueInvoices.filter(
-    (invoice) =>
-      invoice.status === ORDER_STATUS.PAYMENT_CONFIRMED,
-  );
-
   /* -------------------------------------------------------------- */
   /* Total sales and revenue calculations                            */
   /* -------------------------------------------------------------- */
 
-  // Exactly approved + payment-confirmed invoices, filtered by createdAt.
+  // Approved + payment-confirmed invoices, filtered by createdAt.
   const totalSales = invoiceTotalSales(revenueInvoices);
 
   // VAT is extracted from VAT-inclusive Total Sales.
@@ -408,7 +460,7 @@ export async function getFinanceSummary(
   // Approved sales awaiting payment confirmation.
   const pendingAmount = invoiceTotalSales(approved);
 
-  // Payment-confirmed activity uses payment confirmation date.
+  // Confirmed payment activity uses payment confirmation date.
   const confirmedRevenue = invoiceTotalSales(confirmedPayments);
 
   /* -------------------------------------------------------------- */
@@ -494,20 +546,48 @@ export async function getFinanceSummary(
 /* Financial reports                                                   */
 /* ------------------------------------------------------------------ */
 
-export async function getFinancialReports(): Promise<FinancialReportsData> {
-  const invoices = await salesInvoicesRepository.getInvoices();
+export async function getFinancialReports(
+  year?: number,
+  month?: number | null,
+): Promise<FinancialReportsData> {
+  // Default to the current Ethiopian year and month.
+  const period = resolveDashboardPeriod(year, month);
+
+  const allInvoices = await salesInvoicesRepository.getInvoices();
+
+  /**
+   * Sales reporting uses invoice creation date.
+   * This keeps the financial report consistent with the dashboard.
+   */
+  const invoices = allInvoices.filter((invoice) =>
+    matchesPeriod(
+      invoice.createdAt,
+      period.year,
+      period.month,
+    ),
+  );
 
   // Same approved + confirmed sales definition as the dashboard.
   const revenueInvoices = getRevenueInvoices(invoices);
 
+  // Approved sales awaiting payment confirmation.
   const approved = invoices.filter(
     (invoice) =>
       invoice.status === ORDER_STATUS.FINANCE_APPROVED,
   );
 
-  const confirmed = invoices.filter(
+  /**
+   * Confirmed payment activity is filtered by payment confirmation
+   * date rather than invoice creation date.
+   */
+  const confirmedPayments = allInvoices.filter(
     (invoice) =>
-      invoice.status === ORDER_STATUS.PAYMENT_CONFIRMED,
+      invoice.status === ORDER_STATUS.PAYMENT_CONFIRMED &&
+      matchesPeriod(
+        invoice.paymentConfirmedAt ?? invoice.createdAt,
+        period.year,
+        period.month,
+      ),
   );
 
   /* -------------------------------------------------------------- */
@@ -521,10 +601,10 @@ export async function getFinancialReports(): Promise<FinancialReportsData> {
 
     if (!date) continue;
 
-    const period = getEthiopianPeriod(date);
+    const invoicePeriod = getEthiopianPeriod(date);
 
-    byMonth[period.key] =
-      (byMonth[period.key] ?? 0) +
+    byMonth[invoicePeriod.key] =
+      (byMonth[invoicePeriod.key] ?? 0) +
       invoice.financialSummary.totalPriceInclVat;
   }
 
@@ -542,14 +622,18 @@ export async function getFinancialReports(): Promise<FinancialReportsData> {
 
   const royalty = invoiceRoyalty(revenueInvoices);
 
-  const confirmedRevenue = invoiceTotalSales(confirmed);
+  const confirmedRevenue = invoiceTotalSales(confirmedPayments);
 
   /* -------------------------------------------------------------- */
   /* Return reports                                                  */
   /* -------------------------------------------------------------- */
 
   return {
-    byMonth: buildMonthSeries(byMonth),
+    byMonth: buildMonthSeries(
+      byMonth,
+      period.year,
+      period.month,
+    ),
 
     byAggregate: Object.entries(
       revenueInvoices
@@ -588,14 +672,14 @@ export async function getFinancialReports(): Promise<FinancialReportsData> {
     payments: {
       pendingCount: approved.length,
       pendingAmount: invoiceTotalSales(approved),
-      confirmedCount: confirmed.length,
+      confirmedCount: confirmedPayments.length,
       confirmedAmount: confirmedRevenue,
     },
   };
 }
 
 /* ------------------------------------------------------------------ */
-/* Confirmed financial record totals                                   */
+/* Confirmed financial record totals                                  */
 /* ------------------------------------------------------------------ */
 
 export async function getConfirmedRecordTotals(): Promise<{

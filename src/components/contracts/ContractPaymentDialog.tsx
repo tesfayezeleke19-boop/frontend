@@ -1,4 +1,15 @@
-
+/**
+ * Finance dialog for recording contract payment information and the
+ * withholding decision — shared by BOTH contract workflows.
+ *
+ * Mirrors the Sales Invoice payment form (bank, sender, reference, evidence)
+ * and its withholding rule (3% of the VAT-inclusive total, evidence required
+ * when ON), without ever confirming a payment. Everything here is optional
+ * until Finance chooses to record it.
+ *
+ * The component is mounted only while open, so its form state starts from the
+ * current record without effects.
+ */
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -24,46 +35,37 @@ import {
 import { FileUp, Loader2, Paperclip, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { BANKS } from "@/services/sales/banks";
-import { contractsApi } from "@/services/contracts/api";
+import { uploadInvoiceAttachment } from "@/services/sales/apiInvoiceRepo";
 import type { FileEvidence } from "@/services/sales/invoice";
+import { AttachmentViewer } from "./AttachmentViewer";
 import {
+  formatPaymentDateInput,
+  parsePaymentDateInput,
   validatePaymentInformation,
   validateWithholdingInformation,
   type ContractFinancialInput,
   type ContractFinancialReport,
   type ContractPaymentInput,
 } from "@/services/contracts/financials";
-import { EthiopianDatePicker } from "@/components/ui/ethiopian-date-picker";
 
 const inputClass =
   "h-9 border-input bg-popover text-sm text-foreground placeholder:text-muted-foreground/70 focus-visible:border-success focus-visible:ring-ring/30";
-
 const selectTriggerClass =
   "h-9 w-full border-input bg-popover text-sm text-foreground";
 
 interface Props {
-  contractId: string;
   contractNumber: string;
   report: ContractFinancialReport;
+  /** Close without saving. */
   onClose: () => void;
   onSave: (input: ContractFinancialInput) => Promise<void>;
 }
 
 function toDateInput(value?: number): string {
-  if (!value) return "";
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
+  return formatPaymentDateInput(value);
 }
 
 export function ContractPaymentDialog({
-  contractId,
   contractNumber,
   report,
   onClose,
@@ -81,27 +83,27 @@ export function ContractPaymentDialog({
   const [paymentDate, setPaymentDate] = useState(
     toDateInput(existing?.paymentDate),
   );
-  const [paymentReferenceNumber, setPaymentReferenceNumber] =
-    useState(existing?.paymentReferenceNumber ?? "");
+  const [paymentReferenceNumber, setPaymentReferenceNumber] = useState(
+    existing?.paymentReferenceNumber ?? "",
+  );
   const [remark, setRemark] = useState(existing?.remark ?? "");
-  const [paymentEvidence, setPaymentEvidence] =
-    useState<FileEvidence | null>(
-      existing?.paymentEvidence ?? null,
-    );
+  const [paymentEvidence, setPaymentEvidence] = useState<FileEvidence | null>(
+    existing?.paymentEvidence ?? null,
+  );
 
   const [withholdingEnabled, setWithholdingEnabled] = useState(
     Boolean(report.withholding?.enabled),
   );
-
   const [withholdingEvidence, setWithholdingEvidence] =
-    useState<FileEvidence | null>(
-      report.withholding?.evidence ?? null,
-    );
+    useState<FileEvidence | null>(report.withholding?.evidence ?? null);
 
-  const [uploading, setUploading] = useState<
-    "payment" | "withholding" | null
-  >(null);
-
+  const [uploading, setUploading] = useState<"payment" | "withholding" | null>(
+    null,
+  );
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [viewingEvidence, setViewingEvidence] = useState<FileEvidence | null>(
+    null,
+  );
   const [busy, setBusy] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -110,17 +112,18 @@ export function ContractPaymentDialog({
     Boolean(paymentSender.trim()) ||
     Boolean(paymentReferenceNumber.trim()) ||
     Boolean(paymentAmount.trim()) ||
+    Boolean(paymentDate.trim()) ||
+    Boolean(remark.trim()) ||
     Boolean(paymentEvidence);
 
   const buildPayment = (): ContractPaymentInput => ({
     bank,
     paymentSender,
     paymentAmount: Number(paymentAmount) || 0,
-    paymentDate: paymentDate
-      ? new Date(`${paymentDate}T12:00:00`).getTime()
-      : undefined,
+    paymentDate: parsePaymentDateInput(paymentDate),
     paymentReferenceNumber,
-    paymentEvidence: paymentEvidence ?? undefined,
+    // null is an explicit removal; undefined would preserve the old evidence.
+    paymentEvidence: paymentEvidence,
     remark: remark.trim() || undefined,
   });
 
@@ -129,26 +132,12 @@ export function ContractPaymentDialog({
     target: "payment" | "withholding",
   ) => {
     if (!file) return;
-
-    if (uploading || busy) {
-      toast.error("Please wait for the current operation to finish");
-      return;
-    }
-
     setUploading(target);
-
+    setUploadError(null);
     try {
-      // Upload through the Contracts API so the attachment is associated
-      // with this contract and has the correct attachment_type.
-      const evidence = await contractsApi.uploadAttachment(
-        contractId,
-        file,
-        target === "payment" ? "PAYMENT" : "WITHHOLDING",
-      );
-
+      const evidence = await uploadInvoiceAttachment(file);
       if (target === "payment") {
         setPaymentEvidence(evidence);
-
         setErrors((previous) => {
           const next = { ...previous };
           delete next.paymentEvidence;
@@ -156,21 +145,19 @@ export function ContractPaymentDialog({
         });
       } else {
         setWithholdingEvidence(evidence);
-
         setErrors((previous) => {
           const next = { ...previous };
           delete next.withholdingEvidence;
           return next;
         });
       }
-
+      setUploadError(null);
       toast.success(`${file.name} uploaded`);
     } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Evidence upload failed",
-      );
+      const message =
+        error instanceof Error ? error.message : "Evidence upload failed";
+      setUploadError(message);
+      toast.error(message);
     } finally {
       setUploading(null);
     }
@@ -178,48 +165,42 @@ export function ContractPaymentDialog({
 
   const handleSave = async () => {
     if (uploading) {
-      toast.error("Please wait for the evidence upload to finish");
+      toast.error("Wait for the evidence upload to finish.");
+      return;
+    }
+    if (uploadError) {
+      toast.error("Resolve the failed evidence upload before saving.");
       return;
     }
 
-    const next: Record<string, string> = {};
+    const next: Record<string, string> = {}
 
     if (hasPaymentInput) {
-      const validation =
-        validatePaymentInformation(buildPayment());
-
-      if (!validation.valid) {
-        Object.assign(next, validation.errors);
-      }
+      const validation = validatePaymentInformation(buildPayment());
+      if (!validation.valid) Object.assign(next, validation.errors);
     }
-
-    const withholdingValidation =
-      validateWithholdingInformation({
-        enabled: withholdingEnabled,
-        evidence: withholdingEvidence ?? undefined,
-      });
-
+    const withholdingValidation = validateWithholdingInformation({
+      enabled: withholdingEnabled,
+      evidence: withholdingEvidence ?? undefined,
+    });
     if (!withholdingValidation.valid) {
       Object.assign(next, withholdingValidation.errors);
     }
 
     setErrors(next);
-
     if (Object.keys(next).length > 0) return;
 
     setBusy(true);
-
     try {
       await onSave({
+        // An untouched, previously empty form leaves payment information
+        // absent rather than saving a blank record.
         payment: hasPaymentInput ? buildPayment() : undefined,
         withholding: {
           enabled: withholdingEnabled,
-          evidence: withholdingEnabled
-            ? withholdingEvidence ?? undefined
-            : undefined,
+          evidence: withholdingEnabled ? withholdingEvidence : undefined,
         },
       });
-
       toast.success("Contract payment information saved");
       onClose();
     } catch (error) {
@@ -234,30 +215,19 @@ export function ContractPaymentDialog({
   };
 
   const handleClearPayment = async () => {
-    if (uploading) {
-      toast.error("Please wait for the evidence upload to finish");
-      return;
-    }
-
     const confirmed = window.confirm(
       "Remove the recorded payment information from this contract? The audit history keeps a record of the removal.",
     );
-
     if (!confirmed) return;
-
     setBusy(true);
-
     try {
       await onSave({
         payment: null,
         withholding: {
           enabled: withholdingEnabled,
-          evidence: withholdingEnabled
-            ? withholdingEvidence ?? undefined
-            : undefined,
+          evidence: withholdingEnabled ? withholdingEvidence : undefined,
         },
       });
-
       toast.success("Recorded payment information removed");
       onClose();
     } catch (error) {
@@ -283,11 +253,10 @@ export function ContractPaymentDialog({
           <DialogTitle className="text-foreground">
             Payment Information
           </DialogTitle>
-
           <DialogDescription className="text-sm text-muted-foreground">
             {contractNumber} · optional at creation and after completion.
-            Recorded details never mark the contract as paid — confirmed
-            payment comes from the Sales Invoice.
+            Recorded details never mark the contract as paid — confirmed payment
+            comes from the Sales Invoice.
           </DialogDescription>
         </DialogHeader>
 
@@ -297,7 +266,6 @@ export function ContractPaymentDialog({
               <Label className="text-xs font-medium text-muted-foreground">
                 Bank
               </Label>
-
               <Select value={bank} onValueChange={setBank}>
                 <SelectTrigger
                   className={`${selectTriggerClass} mt-1 ${
@@ -306,7 +274,6 @@ export function ContractPaymentDialog({
                 >
                   <SelectValue placeholder="Select bank" />
                 </SelectTrigger>
-
                 <SelectContent className="border-input bg-popover">
                   {BANKS.map((option) => (
                     <SelectItem
@@ -319,56 +286,41 @@ export function ContractPaymentDialog({
                   ))}
                 </SelectContent>
               </Select>
-
               {errors.bank && (
-                <p className="mt-1 text-xs text-destructive">
-                  {errors.bank}
-                </p>
+                <p className="mt-1 text-xs text-destructive">{errors.bank}</p>
               )}
             </div>
-
             <div>
               <Label className="text-xs font-medium text-muted-foreground">
                 Payment Sent By
               </Label>
-
               <Input
                 value={paymentSender}
-                onChange={(event) =>
-                  setPaymentSender(event.target.value)
-                }
+                onChange={(event) => setPaymentSender(event.target.value)}
                 placeholder="e.g. Abebe Kebede"
                 className={`${inputClass} mt-1 ${
                   errors.paymentSender ? "border-destructive" : ""
                 }`}
               />
-
               {errors.paymentSender && (
                 <p className="mt-1 text-xs text-destructive">
                   {errors.paymentSender}
                 </p>
               )}
             </div>
-
             <div>
               <Label className="text-xs font-medium text-muted-foreground">
                 Reported Payment Amount (ETB)
               </Label>
-
               <Input
                 type="number"
                 min="0"
                 step="0.01"
                 value={paymentAmount}
-                onChange={(event) =>
-                  setPaymentAmount(event.target.value)
-                }
+                onChange={(event) => setPaymentAmount(event.target.value)}
                 placeholder="0"
-                className={`${inputClass} mt-1 ${
-                  errors.paymentAmount ? "border-destructive" : ""
-                }`}
+                className={`${inputClass} mt-1 ${errors.paymentAmount ? "border-destructive" : ""}`}
               />
-
               {errors.paymentAmount ? (
                 <p className="mt-1 text-xs text-destructive">
                   {errors.paymentAmount}
@@ -379,32 +331,26 @@ export function ContractPaymentDialog({
                 </p>
               )}
             </div>
-
             <div>
               <Label className="text-xs font-medium text-muted-foreground">
                 Payment Date
               </Label>
-
-              <div className="mt-1">
-                <EthiopianDatePicker
-                  value={paymentDate}
-                  onChange={setPaymentDate}
-                  placeholder="Select payment date"
-                />
-              </div>
-
+              <Input
+                type="date"
+                value={paymentDate}
+                onChange={(event) => setPaymentDate(event.target.value)}
+                className={`${inputClass} mt-1 ${errors.paymentDate ? "border-destructive" : ""}`}
+              />
               {errors.paymentDate && (
                 <p className="mt-1 text-xs text-destructive">
                   {errors.paymentDate}
                 </p>
               )}
             </div>
-
             <div className="sm:col-span-2">
               <Label className="text-xs font-medium text-muted-foreground">
                 Transaction / Reference Number
               </Label>
-
               <Input
                 value={paymentReferenceNumber}
                 onChange={(event) =>
@@ -412,24 +358,19 @@ export function ContractPaymentDialog({
                 }
                 placeholder="e.g. TXN-12345"
                 className={`${inputClass} mt-1 font-mono text-xs ${
-                  errors.paymentReferenceNumber
-                    ? "border-destructive"
-                    : ""
+                  errors.paymentReferenceNumber ? "border-destructive" : ""
                 }`}
               />
-
               {errors.paymentReferenceNumber && (
                 <p className="mt-1 text-xs text-destructive">
                   {errors.paymentReferenceNumber}
                 </p>
               )}
             </div>
-
             <div className="sm:col-span-2">
               <Label className="text-xs font-medium text-muted-foreground">
                 Remark
               </Label>
-
               <Textarea
                 value={remark}
                 onChange={(event) => setRemark(event.target.value)}
@@ -440,18 +381,20 @@ export function ContractPaymentDialog({
             </div>
           </div>
 
+          {/* Payment evidence */}
           <div className="rounded-lg border border-border bg-sidebar p-3">
             <div className="flex items-center justify-between">
               <Label className="text-xs font-medium text-muted-foreground">
                 Payment Evidence
               </Label>
-
               {paymentEvidence && (
                 <Button
                   variant="ghost"
                   size="sm"
-                  disabled={busy || uploading !== null}
-                  onClick={() => setPaymentEvidence(null)}
+                  onClick={() => {
+                    setPaymentEvidence(null);
+                    setUploadError(null);
+                  }}
                   className="h-7 gap-1 text-xs text-destructive hover:text-destructive"
                 >
                   <Trash2 className="size-3" />
@@ -459,32 +402,56 @@ export function ContractPaymentDialog({
                 </Button>
               )}
             </div>
-
             {paymentEvidence ? (
-              <div className="mt-2 flex items-center gap-2 text-xs text-success">
-                <Paperclip className="size-3.5" />
-                <span className="truncate font-medium">
-                  {paymentEvidence.fileName}
-                </span>
+              <div className="mt-2 space-y-2 text-xs text-success">
+                <div className="flex items-center gap-2">
+                  <Paperclip className="size-3.5" />
+                  <span className="truncate font-medium">
+                    {paymentEvidence.fileName}
+                  </span>
+                  {paymentEvidence.fileUrl?.startsWith("/api/") && (
+                    <Button
+                      type="button"
+                      variant="link"
+                      size="sm"
+                      onClick={() => setViewingEvidence(paymentEvidence)}
+                      className="h-auto p-0 text-xs text-info"
+                    >
+                      View
+                    </Button>
+                  )}
+                </div>
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-input p-2 text-xs text-muted-foreground transition-colors hover:border-success/40 hover:text-foreground">
+                  <FileUp className="size-4" />
+                  {uploading === "payment"
+                    ? "Uploading replacement…"
+                    : "Replace payment confirmation"}
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,.pdf"
+                    className="hidden"
+                    onChange={(event) => {
+                      void handleUpload(
+                        event.target.files?.[0] ?? null,
+                        "payment",
+                      );
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
               </div>
             ) : (
               <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-input p-3 text-xs text-muted-foreground transition-colors hover:border-success/40 hover:text-foreground">
                 <FileUp className="size-4" />
-
                 {uploading === "payment"
                   ? "Uploading payment evidence…"
                   : "Upload payment confirmation (optional)"}
-
                 <input
                   type="file"
-                  accept="image/*,.pdf"
-                  disabled={busy || uploading !== null}
+                  accept="image/jpeg,image/png,image/webp,.pdf"
                   className="hidden"
                   onChange={(event) => {
-                    void handleUpload(
-                      event.target.files?.[0] ?? null,
-                      "payment",
-                    );
+                    void handleUpload(event.target.files?.[0] ?? null, "payment");
                     event.currentTarget.value = "";
                   }}
                 />
@@ -494,30 +461,26 @@ export function ContractPaymentDialog({
 
           <Separator className="bg-muted" />
 
+          {/* Withholding */}
           <div className="rounded-lg border border-border bg-sidebar p-3">
             <div className="flex items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-medium text-foreground">
                   Withholding (3%)
                 </div>
-
                 <div className="font-mono text-[10px] text-muted-foreground/70">
                   Applied to the VAT-inclusive total on the resulting invoice.
                   Not a payment, not fulfillment.
                 </div>
               </div>
-
               <div className="flex items-center gap-2">
                 <span className="text-xs text-muted-foreground">
                   {withholdingEnabled ? "ON" : "OFF"}
                 </span>
-
                 <Switch
                   checked={withholdingEnabled}
-                  disabled={busy || uploading !== null}
                   onCheckedChange={(checked) => {
                     setWithholdingEnabled(checked);
-
                     if (!checked) {
                       setErrors((previous) => {
                         const next = { ...previous };
@@ -531,21 +494,35 @@ export function ContractPaymentDialog({
               </div>
             </div>
 
+            {uploadError && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-destructive-border bg-destructive-soft p-2 text-xs text-destructive">
+                <span>{uploadError}</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setUploadError(null)}
+                  className="h-6 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  Discard failed upload
+                </Button>
+              </div>
+            )}
+
             {withholdingEnabled && (
               <div className="mt-3">
                 <div className="flex items-center justify-between">
                   <Label className="text-xs font-medium text-muted-foreground">
                     Withholding Evidence
                   </Label>
-
                   {withholdingEvidence && (
                     <Button
                       variant="ghost"
                       size="sm"
-                      disabled={busy || uploading !== null}
-                      onClick={() =>
-                        setWithholdingEvidence(null)
-                      }
+                      onClick={() => {
+                        setWithholdingEvidence(null);
+                        setUploadError(null);
+                      }}
                       className="h-7 gap-1 text-xs text-destructive hover:text-destructive"
                     >
                       <Trash2 className="size-3" />
@@ -553,26 +530,55 @@ export function ContractPaymentDialog({
                     </Button>
                   )}
                 </div>
-
                 {withholdingEvidence ? (
-                  <div className="mt-2 flex items-center gap-2 text-xs text-success">
-                    <Paperclip className="size-3.5" />
-                    <span className="truncate font-medium">
-                      {withholdingEvidence.fileName}
-                    </span>
+                  <div className="mt-2 space-y-2 text-xs text-success">
+                    <div className="flex items-center gap-2">
+                      <Paperclip className="size-3.5" />
+                      <span className="truncate font-medium">
+                        {withholdingEvidence.fileName}
+                      </span>
+                      {withholdingEvidence.fileUrl?.startsWith("/api/") && (
+                        <Button
+                          type="button"
+                          variant="link"
+                          size="sm"
+                          onClick={() =>
+                            setViewingEvidence(withholdingEvidence)
+                          }
+                          className="h-auto p-0 text-xs text-info"
+                        >
+                          View
+                        </Button>
+                      )}
+                    </div>
+                    <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-input p-2 text-xs text-muted-foreground transition-colors hover:border-success/40 hover:text-foreground">
+                      <FileUp className="size-4" />
+                      {uploading === "withholding"
+                        ? "Uploading replacement…"
+                        : "Replace withholding evidence"}
+                      <input
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp,.pdf"
+                        className="hidden"
+                        onChange={(event) => {
+                          void handleUpload(
+                            event.target.files?.[0] ?? null,
+                            "withholding",
+                          );
+                          event.currentTarget.value = "";
+                        }}
+                      />
+                    </label>
                   </div>
                 ) : (
                   <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-input p-3 text-xs text-muted-foreground transition-colors hover:border-success/40 hover:text-foreground">
                     <FileUp className="size-4" />
-
                     {uploading === "withholding"
                       ? "Uploading withholding evidence…"
                       : "Upload withholding evidence (required when ON)"}
-
                     <input
                       type="file"
-                      accept="image/*,.pdf"
-                      disabled={busy || uploading !== null}
+                      accept="image/jpeg,image/png,image/webp,.pdf"
                       className="hidden"
                       onChange={(event) => {
                         void handleUpload(
@@ -584,7 +590,6 @@ export function ContractPaymentDialog({
                     />
                   </label>
                 )}
-
                 {errors.withholdingEvidence && (
                   <p className="mt-1 text-xs text-destructive">
                     {errors.withholdingEvidence}
@@ -601,27 +606,25 @@ export function ContractPaymentDialog({
               <Button
                 variant="ghost"
                 onClick={() => void handleClearPayment()}
-                disabled={busy || uploading !== null}
+                disabled={busy}
                 className="text-xs text-destructive hover:text-destructive"
               >
                 Remove payment information
               </Button>
             )}
           </div>
-
           <div className="flex gap-2">
             <Button
               variant="outline"
               onClick={onClose}
-              disabled={busy || uploading !== null}
+              disabled={busy}
               className="border-input text-foreground hover:bg-accent"
             >
               Cancel
             </Button>
-
             <Button
               onClick={() => void handleSave()}
-              disabled={busy || uploading !== null}
+              disabled={busy || uploading !== null || Boolean(uploadError)}
               className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
             >
               {busy && <Loader2 className="size-4 animate-spin" />}
@@ -630,6 +633,13 @@ export function ContractPaymentDialog({
           </div>
         </DialogFooter>
       </DialogContent>
+      <AttachmentViewer
+        evidence={viewingEvidence}
+        open={Boolean(viewingEvidence)}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setViewingEvidence(null);
+        }}
+      />
     </Dialog>
   );
 }

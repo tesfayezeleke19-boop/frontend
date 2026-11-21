@@ -42,12 +42,13 @@ export default function OperationalSettings() {
   const [aggregateForm, setAggregateForm] =
     useState<AggregateForm>(emptyAggregateForm);
 
-  const [editingId, setEditingId] = useState<string | null>(null);
+  // Aggregate IDs are numeric in the API.
+  const [editingId, setEditingId] = useState<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
   const [savingAggregate, setSavingAggregate] = useState(false);
-  const [deactivatingId, setDeactivatingId] = useState<string | null>(null);
+  const [deactivatingId, setDeactivatingId] = useState<number | null>(null);
 
   const [settingsError, setSettingsError] = useState("");
   const [aggregateError, setAggregateError] = useState("");
@@ -106,12 +107,14 @@ export default function OperationalSettings() {
   const loadAll = useCallback(async () => {
     setLoading(true);
 
-    await Promise.all([
-      loadSettings(),
-      loadAggregateTypes(),
-    ]);
-
-    setLoading(false);
+    try {
+      await Promise.all([
+        loadSettings(),
+        loadAggregateTypes(),
+      ]);
+    } finally {
+      setLoading(false);
+    }
   }, [loadSettings, loadAggregateTypes]);
 
   useEffect(() => {
@@ -228,7 +231,11 @@ export default function OperationalSettings() {
       return;
     }
 
-    if (!Number.isFinite(price) || price < 0) {
+    if (
+      aggregateForm.pricePerM3.trim() === "" ||
+      !Number.isFinite(price) ||
+      price < 0
+    ) {
       toast.error("Please enter a valid aggregate price.");
       return;
     }
@@ -242,7 +249,7 @@ export default function OperationalSettings() {
         description,
       };
 
-      if (editingId) {
+      if (editingId !== null) {
         await adminOperationalSettingsApi.updateAggregateType(
           editingId,
           payload,
@@ -348,10 +355,7 @@ export default function OperationalSettings() {
         </button>
       </div>
 
-      {/* --------------------------------- */}
       {/* Aggregate Types */}
-      {/* --------------------------------- */}
-
       <section className="space-y-5 rounded-xl border bg-card p-5 shadow-sm">
 
         <div>
@@ -371,10 +375,12 @@ export default function OperationalSettings() {
         >
           <div className="flex items-center justify-between gap-3">
             <h3 className="font-semibold">
-              {editingId ? "Edit Aggregate Type" : "Add New Aggregate Type"}
+              {editingId !== null
+                ? "Edit Aggregate Type"
+                : "Add New Aggregate Type"}
             </h3>
 
-            {editingId && (
+            {editingId !== null && (
               <button
                 type="button"
                 onClick={resetAggregateForm}
@@ -465,7 +471,7 @@ export default function OperationalSettings() {
             >
               {savingAggregate
                 ? "Saving..."
-                : editingId
+                : editingId !== null
                   ? "Update Aggregate"
                   : "Add Aggregate"}
             </button>
@@ -538,10 +544,13 @@ export default function OperationalSettings() {
                       </td>
 
                       <td className="px-4 py-3 tabular-nums">
-                        {aggregate.pricePerM3.toLocaleString("en-US", {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 2,
-                        })}{" "}
+                        {Number(aggregate.pricePerM3).toLocaleString(
+                          "en-US",
+                          {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          },
+                        )}{" "}
                         ETB
                       </td>
 
@@ -597,10 +606,7 @@ export default function OperationalSettings() {
         </div>
       </section>
 
-      {/* --------------------------------- */}
       {/* General Operational Settings */}
-      {/* --------------------------------- */}
-
       <section className="space-y-5 rounded-xl border bg-card p-5 shadow-sm">
 
         <div>

@@ -5,7 +5,7 @@
  * re-fetch whenever contract data changes (or when a Sales Invoice change
  * affects a converted contract's invoice link).
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { subscribeSales } from "@/services/sales/storage";
 import { contractsRepository } from "@/services/contracts/repository";
 import { subscribeContracts } from "@/services/contracts/storage";
@@ -20,6 +20,8 @@ export interface RepoState<T> {
   data: T | null;
   loading: boolean;
   error: Error | null;
+  /** Manual recovery refresh; successful mutations notify subscribers instead. */
+  refresh: () => void;
 }
 
 function useContractData<T>(loader: () => Promise<T>): RepoState<T> {
@@ -27,22 +29,33 @@ function useContractData<T>(loader: () => Promise<T>): RepoState<T> {
     data: null,
     loading: true,
     error: null,
+    refresh: () => undefined,
   });
+  const [reloadToken, setReloadToken] = useState(0);
+  const requestId = useRef(0);
 
   useEffect(() => {
     let active = true;
 
     const load = () => {
+      const currentRequest = ++requestId.current;
       loader().then(
         (data) => {
-          if (active) setState({ data, loading: false, error: null });
+          if (active && currentRequest === requestId.current)
+            setState({
+              data,
+              loading: false,
+              error: null,
+              refresh: () => setReloadToken((token) => token + 1),
+            });
         },
         (error: unknown) => {
-          if (active) {
+          if (active && currentRequest === requestId.current) {
             setState({
               data: null,
               loading: false,
               error: error instanceof Error ? error : new Error(String(error)),
+              refresh: () => setReloadToken((token) => token + 1),
             });
           }
         },
@@ -57,7 +70,7 @@ function useContractData<T>(loader: () => Promise<T>): RepoState<T> {
       unsubscribeContracts();
       unsubscribeSales();
     };
-  }, [loader]);
+  }, [loader, reloadToken]);
 
   return state;
 }

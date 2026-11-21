@@ -1,15 +1,10 @@
+
 /**
  * Admin Expenses — Workflow B: expenses created by Admin/management that
  * require Finance review.
  *
- *   DRAFT → PENDING_FINANCE_REVIEW → APPROVED (or REJECTED → correct → resubmit)
- *
- * Drafts stay editable by their Admin creator and never reach Finance.
- * Submission validates required fields/attachments and enters the Finance
- * review queue with the SAME record ID. Financial fields of a pending
- * expense are frozen while Finance reviews it, and approved expenses are
- * final — they are never resubmitted as a new record. This page is NOT the
- * old Finance→Admin payment queue: that lifecycle is removed.
+ * DRAFT → PENDING_FINANCE_REVIEW → APPROVED
+ *                         or REJECTED → correct → resubmit
  */
 import { EthiopianDatePicker } from "@/components/ui/ethiopian-date-picker";
 import { useMemo, useState } from "react";
@@ -52,11 +47,8 @@ import { expensesRepository } from "@/services/finance/expenses";
 import ExpenseFormDialog from "@/components/finance/ExpenseFormDialog";
 import {
   EXPENSE_TYPE,
-  EXPENSE_TYPE_LABELS,
-  expenseTypeOf,
   getExpenseDisplayStatus,
   type Expense,
-  type ExpenseType,
 } from "@/services/finance/types";
 import { matchesExpenseSearch } from "@/services/finance/expenseFilters";
 import { formatCurrency, formatDate } from "@/services/sales/format";
@@ -64,18 +56,64 @@ import { roundMoney } from "@/services/sales/calc";
 
 const inputClass =
   "h-9 border-input bg-popover text-sm text-foreground placeholder:text-muted-foreground/70 focus-visible:border-success focus-visible:ring-ring/30";
+
 const selectTriggerClass =
   "h-9 border-input bg-popover text-sm text-foreground";
 
 type StatusFilter = "ALL" | "DRAFT" | "PENDING" | "APPROVED" | "REJECTED";
 
+type ExpenseCategory = "STANDARD" | "CASUAL";
+
+type AdminExpenseApiFields = {
+  expense_category?: string | null;
+  expenseCategory?: string | null;
+  category?: string | null;
+  expense_type?: string | null;
+  expenseType?: string | null;
+  type?: string | null;
+};
+
+/**
+ * Category is STANDARD or CASUAL.
+ * Always read the category field, never the actual expense type field.
+ */
+function getAdminExpenseCategory(expense: Expense): string {
+  const record = expense as Expense & AdminExpenseApiFields;
+
+  return String(
+    record.expense_category ??
+      record.expenseCategory ??
+      record.category ??
+      "",
+  )
+    .trim()
+    .toUpperCase();
+}
+
+/**
+ * Type is the actual expense type, for example Fuel, Rent, or Maintenance.
+ * Never use Category as a fallback for Type.
+ */
+function getAdminExpenseType(expense: Expense): string {
+  const record = expense as Expense & AdminExpenseApiFields;
+
+  return String(
+    record.expense_type ??
+      record.expenseType ??
+      record.type ??
+      "",
+  ).trim();
+}
+
 export default function AdminExpenses() {
   const { user } = useAuth();
   const actor = actorLabel(user);
   const { data: expenses, loading } = useAdminExpenses();
+
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<StatusFilter>("ALL");
-  const [typeFilter, setTypeFilter] = useState<"ALL" | ExpenseType>("ALL");
+  const [categoryFilter, setCategoryFilter] =
+    useState<"ALL" | ExpenseCategory>("ALL");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [formOpen, setFormOpen] = useState(false);
@@ -86,73 +124,121 @@ export default function AdminExpenses() {
 
   const rangeBounds = useMemo(() => {
     let error = "";
-    const from = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : null;
-    const to = toDate ? new Date(`${toDate}T23:59:59.999`).getTime() : null;
-    if (from !== null && Number.isNaN(from)) error = "Invalid start date";
-    else if (to !== null && Number.isNaN(to)) error = "Invalid end date";
-    else if (from !== null && to !== null && from > to) {
+
+    const from = fromDate
+      ? new Date(`${fromDate}T00:00:00`).getTime()
+      : null;
+
+    const to = toDate
+      ? new Date(`${toDate}T23:59:59.999`).getTime()
+      : null;
+
+    if (from !== null && Number.isNaN(from)) {
+      error = "Invalid start date";
+    } else if (to !== null && Number.isNaN(to)) {
+      error = "Invalid end date";
+    } else if (from !== null && to !== null && from > to) {
       error = "Start date must not be after the end date";
     }
+
     return { from, to, error };
   }, [fromDate, toDate]);
 
   const filtered = useMemo(() => {
     const list = expenses ?? [];
     const { from, to } = rangeBounds;
+
     return list.filter((expense) => {
-      if (status === "DRAFT" && expense.reviewStatus !== "DRAFT") return false;
-      if (status === "PENDING" && expense.reviewStatus !== "PENDING_FINANCE_REVIEW")
-        return false;
-      if (status === "APPROVED" && expense.reviewStatus !== "APPROVED") return false;
-      if (status === "REJECTED" && expense.reviewStatus !== "REJECTED") return false;
-      if (typeFilter !== "ALL" && expenseTypeOf(expense) !== typeFilter) {
+      if (status === "DRAFT" && expense.reviewStatus !== "DRAFT") {
         return false;
       }
-      if (from !== null && !Number.isNaN(from) && expense.date < from) return false;
-      if (to !== null && !Number.isNaN(to) && expense.date > to) return false;
-      // Shared search implementation (item, category, type, bank, reference,
-      // amounts) — no duplicated filter logic between Finance and Admin.
+
+      if (
+        status === "PENDING" &&
+        expense.reviewStatus !== "PENDING_FINANCE_REVIEW"
+      ) {
+        return false;
+      }
+
+      if (status === "APPROVED" && expense.reviewStatus !== "APPROVED") {
+        return false;
+      }
+
+      if (status === "REJECTED" && expense.reviewStatus !== "REJECTED") {
+        return false;
+      }
+
+      // Category filter: STANDARD or CASUAL.
+      if (
+        categoryFilter !== "ALL" &&
+        getAdminExpenseCategory(expense) !== categoryFilter
+      ) {
+        return false;
+      }
+
+      if (from !== null && !Number.isNaN(from) && expense.date < from) {
+        return false;
+      }
+
+      if (to !== null && !Number.isNaN(to) && expense.date > to) {
+        return false;
+      }
+
       return matchesExpenseSearch(expense, search);
     });
-  }, [expenses, search, status, typeFilter, rangeBounds]);
+  }, [expenses, search, status, categoryFilter, rangeBounds]);
 
   const counts = useMemo(() => {
     const list = expenses ?? [];
+
     return {
       drafts: list.filter((e) => e.reviewStatus === "DRAFT").length,
-      pending: list.filter((e) => e.reviewStatus === "PENDING_FINANCE_REVIEW").length,
+      pending: list.filter(
+        (e) => e.reviewStatus === "PENDING_FINANCE_REVIEW",
+      ).length,
       approved: list.filter((e) => e.reviewStatus === "APPROVED").length,
       rejected: list.filter((e) => e.reviewStatus === "REJECTED").length,
       pendingAmount: roundMoney(
         list
           .filter((e) => e.reviewStatus === "PENDING_FINANCE_REVIEW")
-          .reduce((s, e) => s + (Number.isFinite(e.amount) ? e.amount : 0), 0),
+          .reduce(
+            (sum, e) => sum + (Number.isFinite(e.amount) ? e.amount : 0),
+            0,
+          ),
       ),
     };
   }, [expenses]);
 
   const handleSubmit = async () => {
     if (!submitTarget) return;
+
     setIsSubmitting(true);
+
     try {
       const updated = await expensesRepository.submitAdminExpense(
         submitTarget.id,
         actor,
       );
+
       toast.success(
         `"${updated.item}" submitted to Finance for review — the same record ID is preserved.`,
       );
+
       setSubmitTarget(null);
       setDetail(null);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Failed to submit expense");
+      toast.error(
+        e instanceof Error ? e.message : "Failed to submit expense",
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const canSubmit = (expense: Expense) =>
-    expense.reviewStatus === "DRAFT" || expense.reviewStatus === "REJECTED";
+    expense.reviewStatus === "DRAFT" ||
+    expense.reviewStatus === "REJECTED";
+
   const canEdit = (expense: Expense) =>
     expense.reviewStatus === "DRAFT" ||
     expense.reviewStatus === "REJECTED" ||
@@ -174,8 +260,8 @@ export default function AdminExpenses() {
           <h1 className="font-heading text-2xl font-semibold text-foreground">
             Expenses
           </h1>
-        
         </div>
+
         <Button
           onClick={() => {
             setEditing(null);
@@ -196,13 +282,16 @@ export default function AdminExpenses() {
               <FileText className="size-4 text-foreground" />
             </div>
             <div>
-              <span className="text-xs font-medium text-muted-foreground">Drafts</span>
+              <span className="text-xs font-medium text-muted-foreground">
+                Drafts
+              </span>
               <div className="text-xl font-semibold tabular-nums text-foreground">
                 {counts.drafts}
               </div>
             </div>
           </CardContent>
         </Card>
+
         <Card
           className={`shadow-none ${
             counts.pending > 0
@@ -222,9 +311,12 @@ export default function AdminExpenses() {
             </div>
           </CardContent>
         </Card>
+
         <Card className="border-border bg-card shadow-none">
           <CardContent className="p-4">
-            <span className="text-xs font-medium text-muted-foreground">Approved</span>
+            <span className="text-xs font-medium text-muted-foreground">
+              Approved
+            </span>
             <div className="mt-2 font-heading text-xl font-semibold tabular-nums text-success">
               {counts.approved}
             </div>
@@ -233,9 +325,12 @@ export default function AdminExpenses() {
             </div>
           </CardContent>
         </Card>
+
         <Card className="border-border bg-card shadow-none">
           <CardContent className="p-4">
-            <span className="text-xs font-medium text-muted-foreground">Rejected</span>
+            <span className="text-xs font-medium text-muted-foreground">
+              Rejected
+            </span>
             <div className="mt-2 font-heading text-xl font-semibold tabular-nums text-destructive">
               {counts.rejected}
             </div>
@@ -258,37 +353,51 @@ export default function AdminExpenses() {
               className={`${inputClass} w-full pl-9`}
             />
           </div>
+
           <Select
-            value={typeFilter}
-            onValueChange={(v) => setTypeFilter(v as "ALL" | ExpenseType)}
+            value={categoryFilter}
+            onValueChange={(value) =>
+              setCategoryFilter(value as "ALL" | ExpenseCategory)
+            }
           >
             <SelectTrigger className={`${selectTriggerClass} w-36`}>
               <SelectValue />
             </SelectTrigger>
+
             <SelectContent className="border-input bg-popover">
               <SelectItem
                 value="ALL"
                 className="text-sm text-foreground focus:bg-accent"
               >
-                All types
+                All categories
               </SelectItem>
-              {([EXPENSE_TYPE.STANDARD, EXPENSE_TYPE.CASUAL] as const).map(
-                (type) => (
-                  <SelectItem
-                    key={type}
-                    value={type}
-                    className="text-sm text-foreground focus:bg-accent"
-                  >
-                    {EXPENSE_TYPE_LABELS[type]}
-                  </SelectItem>
-                ),
-              )}
+
+              <SelectItem
+                value="STANDARD"
+                className="text-sm text-foreground focus:bg-accent"
+              >
+                Standard
+              </SelectItem>
+
+              <SelectItem
+                value="CASUAL"
+                className="text-sm text-foreground focus:bg-accent"
+              >
+                Casual
+              </SelectItem>
             </SelectContent>
           </Select>
-          <Select value={status} onValueChange={(v) => setStatus(v as StatusFilter)}>
+
+          <Select
+            value={status}
+            onValueChange={(value) =>
+              setStatus(value as StatusFilter)
+            }
+          >
             <SelectTrigger className={`${selectTriggerClass} w-48`}>
               <SelectValue />
             </SelectTrigger>
+
             <SelectContent className="border-input bg-popover">
               {(
                 [
@@ -309,31 +418,37 @@ export default function AdminExpenses() {
               ))}
             </SelectContent>
           </Select>
+
           <div className="w-40">
-  <EthiopianDatePicker
-    value={fromDate}
-    onChange={setFromDate}
-    placeholder="Start date"
-  />
-</div>
+            <EthiopianDatePicker
+              value={fromDate}
+              onChange={setFromDate}
+              placeholder="Start date"
+            />
+          </div>
 
-<span className="text-xs text-muted-foreground/70">to</span>
+          <span className="text-xs text-muted-foreground/70">to</span>
 
-<div className="w-40">
-  <EthiopianDatePicker
-    value={toDate}
-    onChange={setToDate}
-    placeholder="End date"
-  />
-</div>
-          {(search || status !== "ALL" || typeFilter !== "ALL" || fromDate || toDate) && (
+          <div className="w-40">
+            <EthiopianDatePicker
+              value={toDate}
+              onChange={setToDate}
+              placeholder="End date"
+            />
+          </div>
+
+          {(search ||
+            status !== "ALL" ||
+            categoryFilter !== "ALL" ||
+            fromDate ||
+            toDate) && (
             <Button
               variant="ghost"
               size="sm"
               onClick={() => {
                 setSearch("");
                 setStatus("ALL");
-                setTypeFilter("ALL");
+                setCategoryFilter("ALL");
                 setFromDate("");
                 setToDate("");
               }}
@@ -344,9 +459,12 @@ export default function AdminExpenses() {
             </Button>
           )}
         </CardContent>
+
         {rangeBounds.error && (
           <CardContent className="pt-0">
-            <p className="text-xs text-destructive">{rangeBounds.error}</p>
+            <p className="text-xs text-destructive">
+              {rangeBounds.error}
+            </p>
           </CardContent>
         )}
       </Card>
@@ -361,6 +479,7 @@ export default function AdminExpenses() {
             Filtered view count — not an all-time total.
           </p>
         </CardHeader>
+
         <CardContent className="p-0">
           {filtered.length > 0 ? (
             <div className="overflow-x-auto">
@@ -371,17 +490,27 @@ export default function AdminExpenses() {
                     <th className="px-4 py-2.5 font-medium">Category</th>
                     <th className="px-4 py-2.5 font-medium">Item</th>
                     <th className="px-4 py-2.5 font-medium">Type</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Total / After VAT</th>
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Total / After VAT
+                    </th>
                     <th className="px-4 py-2.5 text-right font-medium">WHT</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Transferred</th>
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Transferred
+                    </th>
                     <th className="px-4 py-2.5 font-medium">Status</th>
                     <th className="px-4 py-2.5 font-medium">Submitted</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Actions</th>
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Actions
+                    </th>
                   </tr>
                 </thead>
+
                 <tbody>
                   {filtered.map((expense) => {
                     const display = getExpenseDisplayStatus(expense);
+                    const category = getAdminExpenseCategory(expense);
+                    const expenseType = getAdminExpenseType(expense);
+
                     return (
                       <tr
                         key={expense.id}
@@ -390,36 +519,38 @@ export default function AdminExpenses() {
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                           {formatDate(expense.date)}
                         </td>
+
                         <td className="px-4 py-2.5 text-muted-foreground">
-                          {expense.category || "—"}
+                          {category || "—"}
                         </td>
+
                         <td className="px-4 py-2.5 text-foreground">
                           {expense.item}
                           <div className="font-mono text-[10px] text-muted-foreground/70">
                             {expense.id.slice(0, 8)}
                           </div>
                         </td>
-                        <td className="px-4 py-2.5">
-                          <Badge
-                            variant="outline"
-                            className={`border text-[10px] font-medium ${
-                              expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
-                                ? "erp-badge-draft"
-                                : "erp-badge-approved"
-                            }`}
-                          >
-                            {EXPENSE_TYPE_LABELS[expenseTypeOf(expense)]}
-                          </Badge>
+
+                        <td className="px-4 py-2.5 text-foreground">
+                          {expenseType || "—"}
                         </td>
+
                         <td className="px-4 py-2.5 text-right font-medium tabular-nums text-destructive">
                           {formatCurrency(expense.amount)}
                         </td>
+
                         <td className="px-4 py-2.5 text-right tabular-nums text-violet">
-                          {expense.whtAmount ? formatCurrency(expense.whtAmount) : "—"}
+                          {expense.whtAmount
+                            ? formatCurrency(expense.whtAmount)
+                            : "—"}
                         </td>
+
                         <td className="px-4 py-2.5 text-right font-medium tabular-nums text-foreground">
-                          {formatCurrency(expense.totalTransferred ?? expense.amount)}
+                          {formatCurrency(
+                            expense.totalTransferred ?? expense.amount,
+                          )}
                         </td>
+
                         <td className="px-4 py-2.5">
                           <Badge
                             variant="outline"
@@ -427,6 +558,7 @@ export default function AdminExpenses() {
                           >
                             {display.label}
                           </Badge>
+
                           {expense.reviewStatus === "REJECTED" &&
                             expense.rejectionReason && (
                               <div
@@ -436,6 +568,7 @@ export default function AdminExpenses() {
                                 Reason: {expense.rejectionReason}
                               </div>
                             )}
+
                           {expense.reviewStatus === "APPROVED" &&
                             expense.reviewedBy && (
                               <div className="mt-0.5 text-[10px] text-success">
@@ -443,9 +576,13 @@ export default function AdminExpenses() {
                               </div>
                             )}
                         </td>
+
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                          {expense.submittedAt ? formatDate(expense.submittedAt) : "—"}
+                          {expense.submittedAt
+                            ? formatDate(expense.submittedAt)
+                            : "—"}
                         </td>
+
                         <td className="px-4 py-2.5 text-right">
                           <div className="flex items-center justify-end gap-1">
                             <Button
@@ -457,6 +594,7 @@ export default function AdminExpenses() {
                               <Paperclip className="size-3" />
                               View
                             </Button>
+
                             {canEdit(expense) && (
                               <Button
                                 variant="ghost"
@@ -471,6 +609,7 @@ export default function AdminExpenses() {
                                 Edit
                               </Button>
                             )}
+
                             {canSubmit(expense) && (
                               <Button
                                 variant="ghost"
@@ -539,68 +678,103 @@ export default function AdminExpenses() {
                   Full record — opening this dialog does not change anything.
                 </DialogDescription>
               </DialogHeader>
+
               <div className="space-y-4 text-sm">
                 <div className="rounded-lg border border-border bg-sidebar p-3">
                   <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
                     Amount breakdown
                   </div>
+
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                     <div>
-                      <div className="text-xs text-muted-foreground">Expense date</div>
-                      <div className="mt-1 text-foreground">{formatDate(detail.date)}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">Category</div>
-                      <div className="mt-1 text-foreground">{detail.category || "—"}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">Expense type</div>
+                      <div className="text-xs text-muted-foreground">
+                        Expense date
+                      </div>
                       <div className="mt-1 text-foreground">
-                        {EXPENSE_TYPE_LABELS[expenseTypeOf(detail)]}
+                        {formatDate(detail.date)}
                       </div>
                     </div>
+
                     <div>
-                      <div className="text-xs text-muted-foreground">Before VAT</div>
+                      <div className="text-xs text-muted-foreground">
+                        Category
+                      </div>
+                      <div className="mt-1 text-foreground">
+                        {getAdminExpenseCategory(detail) || "—"}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-xs text-muted-foreground">
+                        Expense type
+                      </div>
+                      <div className="mt-1 text-foreground">
+                        {getAdminExpenseType(detail) || "—"}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-xs text-muted-foreground">
+                        Before VAT
+                      </div>
                       <div className="mt-1 tabular-nums text-foreground">
                         {formatCurrency(detail.amountBeforeVat ?? 0)}
                       </div>
                     </div>
+
                     <div>
                       <div className="text-xs text-muted-foreground">VAT</div>
                       <div className="mt-1 tabular-nums text-warning">
-                        {expenseTypeOf(detail) === EXPENSE_TYPE.CASUAL
+                        {getAdminExpenseCategory(detail) ===
+                        EXPENSE_TYPE.CASUAL
                           ? "Not applicable"
                           : formatCurrency(detail.vatAmount ?? 0)}
                       </div>
                     </div>
+
                     <div>
-                      <div className="text-xs text-muted-foreground">Total / After VAT</div>
+                      <div className="text-xs text-muted-foreground">
+                        Total / After VAT
+                      </div>
                       <div className="mt-1 font-medium tabular-nums text-foreground">
                         {formatCurrency(detail.amount)}
                       </div>
                     </div>
+
                     <div>
                       <div className="text-xs text-muted-foreground">
                         WHT ({detail.whtEnabled ? "3%" : "OFF"})
                       </div>
                       <div className="mt-1 tabular-nums text-violet">
-                        {detail.whtAmount ? formatCurrency(detail.whtAmount) : "—"}
+                        {detail.whtAmount
+                          ? formatCurrency(detail.whtAmount)
+                          : "—"}
                       </div>
                     </div>
+
                     <div>
-                      <div className="text-xs text-muted-foreground">Total Transferred</div>
+                      <div className="text-xs text-muted-foreground">
+                        Total Transferred
+                      </div>
                       <div className="mt-1 font-medium tabular-nums text-success">
-                        {formatCurrency(detail.totalTransferred ?? detail.amount)}
+                        {formatCurrency(
+                          detail.totalTransferred ?? detail.amount,
+                        )}
                       </div>
                     </div>
+
                     <div>
-                      <div className="text-xs text-muted-foreground">Bank</div>
+                      <div className="text-xs text-muted-foreground">
+                        Bank
+                      </div>
                       <div className="mt-1 text-foreground">
                         {detail.bank ||
-                          (expenseTypeOf(detail) === EXPENSE_TYPE.CASUAL
+                          (getAdminExpenseCategory(detail) ===
+                          EXPENSE_TYPE.CASUAL
                             ? "Not provided (optional)"
                             : "Not provided")}
                       </div>
+
                       {detail.paymentReference && (
                         <div className="font-mono text-xs text-muted-foreground/70">
                           Ref: {detail.paymentReference}
@@ -612,48 +786,68 @@ export default function AdminExpenses() {
 
                 {detail.remark && (
                   <div className="rounded-lg border border-border bg-sidebar p-3">
-                    <div className="text-xs text-muted-foreground">Remark / explanation</div>
-                    <div className="mt-1 text-foreground">{detail.remark}</div>
-                  </div>
-                )}
-
-                {detail.reviewStatus === "REJECTED" && detail.rejectionReason && (
-                  <div className="rounded-lg border border-destructive-border bg-destructive-soft p-3">
-                    <div className="text-xs font-medium text-destructive">
-                      Rejected by {detail.reviewedBy || "Finance"}
-                      {detail.reviewedAt
-                        ? ` · ${formatDate(detail.reviewedAt, { time: true })}`
-                        : ""}
+                    <div className="text-xs text-muted-foreground">
+                      Remark / explanation
                     </div>
-                    <div className="mt-1 text-sm text-foreground">
-                      {detail.rejectionReason}
+                    <div className="mt-1 text-foreground">
+                      {detail.remark}
                     </div>
                   </div>
                 )}
 
-                {detail.statusHistory && detail.statusHistory.length > 0 && (
-                  <div className="rounded-lg border border-border bg-sidebar p-3">
-                    <div className="mb-2 text-xs text-muted-foreground">Status history</div>
-                    <ol className="space-y-1">
-                      {detail.statusHistory.map((entry, i) => (
-                        <li key={i} className="text-xs text-muted-foreground">
-                          {formatDate(entry.at, { time: true })} — {entry.status}
-                          {entry.actor ? ` by ${entry.actor}` : ""}
-                          {entry.note ? ` · ${entry.note}` : ""}
-                        </li>
-                      ))}
-                    </ol>
-                  </div>
-                )}
+                {detail.reviewStatus === "REJECTED" &&
+                  detail.rejectionReason && (
+                    <div className="rounded-lg border border-destructive-border bg-destructive-soft p-3">
+                      <div className="text-xs font-medium text-destructive">
+                        Rejected by {detail.reviewedBy || "Finance"}
+                        {detail.reviewedAt
+                          ? ` · ${formatDate(detail.reviewedAt, {
+                              time: true,
+                            })}`
+                          : ""}
+                      </div>
+                      <div className="mt-1 text-sm text-foreground">
+                        {detail.rejectionReason}
+                      </div>
+                    </div>
+                  )}
+
+                {detail.statusHistory &&
+                  detail.statusHistory.length > 0 && (
+                    <div className="rounded-lg border border-border bg-sidebar p-3">
+                      <div className="mb-2 text-xs text-muted-foreground">
+                        Status history
+                      </div>
+                      <ol className="space-y-1">
+                        {detail.statusHistory.map((entry, i) => (
+                          <li
+                            key={i}
+                            className="text-xs text-muted-foreground"
+                          >
+                            {formatDate(entry.at, { time: true })} —{" "}
+                            {entry.status}
+                            {entry.actor ? ` by ${entry.actor}` : ""}
+                            {entry.note ? ` · ${entry.note}` : ""}
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
 
                 <div className="rounded-lg border border-border bg-sidebar p-3">
                   <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
                     Attachments
                   </div>
-                  {[detail.invoiceAttachment, detail.whtAttachment].filter(Boolean).length >
-                  0 ? (
+
+                  {[
+                    detail.invoiceAttachment,
+                    detail.whtAttachment,
+                  ].filter(Boolean).length > 0 ? (
                     <ul className="space-y-1.5">
-                      {[detail.invoiceAttachment, detail.whtAttachment]
+                      {[
+                        detail.invoiceAttachment,
+                        detail.whtAttachment,
+                      ]
                         .filter(Boolean)
                         .map((attachment) =>
                           attachment ? (
@@ -674,14 +868,18 @@ export default function AdminExpenses() {
                         )}
                     </ul>
                   ) : (
-                    <p className="text-xs text-muted-foreground">No attachments</p>
+                    <p className="text-xs text-muted-foreground">
+                      No attachments
+                    </p>
                   )}
+
                   <p className="mt-2 text-[10px] text-muted-foreground/70">
                     Note: attachments are stored as browser-session metadata
                     until proper backend file storage exists.
                   </p>
                 </div>
               </div>
+
               <DialogFooter>
                 {canSubmit(detail) && (
                   <Button
@@ -692,6 +890,7 @@ export default function AdminExpenses() {
                     Submit for Review
                   </Button>
                 )}
+
                 <Button
                   variant="ghost"
                   onClick={() => setDetail(null)}
@@ -720,12 +919,13 @@ export default function AdminExpenses() {
               <span className="font-medium text-foreground">
                 "{submitTarget?.item}"
               </span>{" "}
-              ({formatCurrency(submitTarget?.amount ?? 0)} after VAT) to Finance?
-              The record leaves your drafts and becomes Pending Finance Review
-              — its financial fields are frozen while Finance reviews it. The
-              same record ID is kept.
+              ({formatCurrency(submitTarget?.amount ?? 0)} after VAT) to
+              Finance? The record leaves your drafts and becomes Pending
+              Finance Review — its financial fields are frozen while Finance
+              reviews it. The same record ID is kept.
             </DialogDescription>
           </DialogHeader>
+
           <DialogFooter>
             <Button
               variant="ghost"
@@ -735,6 +935,7 @@ export default function AdminExpenses() {
             >
               Cancel
             </Button>
+
             <Button
               onClick={handleSubmit}
               disabled={isSubmitting}
@@ -756,6 +957,10 @@ export default function AdminExpenses() {
 
 function chunkSizeLabel(size: number): string {
   if (!Number.isFinite(size) || size <= 0) return "";
+
   const kb = Math.round(size / 1024);
-  return kb > 1024 ? ` · ${(kb / 1024).toFixed(1)} MB` : ` · ${kb} KB`;
+
+  return kb > 1024
+    ? ` · ${(kb / 1024).toFixed(1)} MB`
+    : ` · ${kb} KB`;
 }

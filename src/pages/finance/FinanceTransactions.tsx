@@ -1,3 +1,4 @@
+
 /**
  * Finance Transactions — history and discovery over the CANONICAL Sales
  * Invoice dataset (src/services/sales/invoiceRepo). This is a second read
@@ -15,7 +16,7 @@ import { EthiopianDatePicker } from "@/components/ui/ethiopian-date-picker";
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -104,56 +105,105 @@ function dateRange(
   const midnight = (d: Date) =>
     new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
   const dayEnd = (d: Date) => midnight(d) + 24 * 60 * 60 * 1000;
+
   switch (filter) {
     case "all":
       return { start: null, end: null };
+
     case "today":
       return { start: midnight(now), end: dayEnd(now) };
+
     case "yesterday": {
       const d = new Date(now);
       d.setDate(now.getDate() - 1);
       return { start: midnight(d), end: dayEnd(d) };
     }
+
     case "this-week": {
       const { start, end } = weekRange(now);
       return { start: midnight(start), end: dayEnd(end) };
     }
+
     case "last-week": {
       const last = new Date(now);
       last.setDate(now.getDate() - 7);
       const { start, end } = weekRange(last);
       return { start: midnight(start), end: dayEnd(end) };
     }
+
     case "month":
       return {
         start: new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
         end: new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime(),
       };
+
     case "last-month":
       return {
         start: new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime(),
         end: new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
       };
+
     case "custom": {
-      const start = customFrom ? new Date(`${customFrom}T00:00:00`).getTime() : null;
-      const end = customTo
-        ? new Date(`${customTo}T00:00:00`).getTime() + 24 * 60 * 60 * 1000
+      const start = customFrom
+        ? new Date(`${customFrom}T00:00:00`).getTime()
         : null;
+
+      const end = customTo
+        ? new Date(`${customTo}T00:00:00`).getTime() +
+          24 * 60 * 60 * 1000
+        : null;
+
       return { start, end };
     }
+
     default:
       return { start: null, end: null };
   }
 }
 
 /**
- * Full-dataset search: parent invoice fields ↑, then every child Order's
+ * Compare invoice numbers by their numeric portions first.
+ *
+ * This allows different invoice prefixes (for example, Sales and Contract
+ * invoices) to be ordered together by their invoice number instead of
+ * grouping them alphabetically by invoice type.
+ *
+ * Sorting is descending: the larger invoice number comes first.
+ */
+function compareInvoiceNumbersDescending(
+  a: string,
+  b: string,
+): number {
+  const aNumbers = a.match(/\d+/g)?.map(Number) ?? [];
+  const bNumbers = b.match(/\d+/g)?.map(Number) ?? [];
+
+  const length = Math.min(aNumbers.length, bNumbers.length);
+
+  for (let i = 0; i < length; i++) {
+    if (aNumbers[i] !== bNumbers[i]) {
+      return bNumbers[i] - aNumbers[i];
+    }
+  }
+
+  if (aNumbers.length !== bNumbers.length) {
+    return bNumbers.length - aNumbers.length;
+  }
+
+  return b.localeCompare(a, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+/**
+ * Full-dataset search: parent invoice fields, then every child Order's
  * fields (royalty invoice number, aggregate). Partial matches, case-
  * insensitive, whitespace-trimmed, numeric lists as text. The aggregate
  * code "00" keeps its leading zero because both sides stay strings.
  */
 function invoiceMatchesQuery(invoice: SalesInvoice, query: string): boolean {
   const q = query.toLowerCase();
+
   if (invoice.invoiceNumber.toLowerCase().includes(q)) return true;
   if (invoice.fsNo.toLowerCase().includes(q)) return true;
   if (invoice.customer.name.toLowerCase().includes(q)) return true;
@@ -162,6 +212,7 @@ function invoiceMatchesQuery(invoice: SalesInvoice, query: string): boolean {
   if (invoice.payment.paymentSender.toLowerCase().includes(q)) return true;
   if (invoice.payment.paymentReferenceNumber.toLowerCase().includes(q)) return true;
   if (ORDER_STATUS_LABELS[invoice.status].toLowerCase().includes(q)) return true;
+
   return invoice.orders.some(
     (order) =>
       order.aggregate.toLowerCase().includes(q) ||
@@ -171,6 +222,7 @@ function invoiceMatchesQuery(invoice: SalesInvoice, query: string): boolean {
 }
 
 type SortKey = "invoiceNumber" | "totalPrice" | "createdAt" | "customer";
+
 interface SortState {
   key: SortKey;
   dir: "asc" | "desc";
@@ -190,11 +242,13 @@ function SortButton({
   align?: "left" | "right";
 }) {
   const active = sort.key === column;
+
   const Icon = active
     ? sort.dir === "asc"
       ? ChevronUp
       : ChevronDown
     : ChevronsUpDown;
+
   return (
     <button
       onClick={() => onSort(column)}
@@ -203,19 +257,30 @@ function SortButton({
       }`}
     >
       {label}
-      <Icon className={`size-3 ${active ? "text-success" : "text-muted-foreground"}`} />
+      <Icon
+        className={`size-3 ${
+          active ? "text-success" : "text-muted-foreground"
+        }`}
+      />
     </button>
   );
 }
 
 export default function FinanceTransactions() {
   const navigate = useNavigate();
+
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [dateFilter, setDateFilter] = useState<string>("all");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
-  const [sort, setSort] = useState<SortState>({ key: "createdAt", dir: "desc" });
+
+  // Default sorting: largest invoice number first.
+  const [sort, setSort] = useState<SortState>({
+    key: "invoiceNumber",
+    dir: "desc",
+  });
+
   const [page, setPage] = useState(0);
 
   const { data: invoices, loading, error } = useSalesInvoices();
@@ -228,48 +293,98 @@ export default function FinanceTransactions() {
     !!customTo &&
     new Date(`${customFrom}T00:00:00`).getTime() >
       new Date(`${customTo}T00:00:00`).getTime();
+
   const customError = customInvalid
     ? "Start date must not be after the end date"
     : "";
 
   const filtered = useMemo(() => {
     const list = invoices ?? [];
+
     const status =
-      statusFilter === "all" ? null : (statusFilter as OrderStatus);
-    const { start, end } = dateRange(dateFilter, customFrom, customTo);
+      statusFilter === "all"
+        ? null
+        : (statusFilter as OrderStatus);
+
+    const { start, end } = dateRange(
+      dateFilter,
+      customFrom,
+      customTo,
+    );
+
     const query = search.trim();
+
     return list.filter((invoice) => {
       if (status && invoice.status !== status) return false;
-      if (customInvalid) return false; // empty result rather than a wrong one
-      const date = invoice.date; // business date, not the latest update time
+
+      if (customInvalid) return false;
+
+      const date = invoice.date;
+
       if (start !== null && date < start) return false;
       if (end !== null && date >= end) return false;
-      if (query && !invoiceMatchesQuery(invoice, query)) return false;
+
+      if (query && !invoiceMatchesQuery(invoice, query)) {
+        return false;
+      }
+
       return true;
     });
-  }, [invoices, search, statusFilter, dateFilter, customFrom, customTo, customInvalid]);
+  }, [
+    invoices,
+    search,
+    statusFilter,
+    dateFilter,
+    customFrom,
+    customTo,
+    customInvalid,
+  ]);
 
   const sorted = useMemo(() => {
     const list = [...filtered];
+
     list.sort((a, b) => {
       let cmp = 0;
+
       if (sort.key === "invoiceNumber") {
-        cmp = a.invoiceNumber.localeCompare(b.invoiceNumber);
+        cmp = compareInvoiceNumbersDescending(
+          a.invoiceNumber,
+          b.invoiceNumber,
+        );
       } else if (sort.key === "totalPrice") {
-        cmp = a.financialSummary.totalPriceInclVat - b.financialSummary.totalPriceInclVat;
+        cmp =
+          a.financialSummary.totalPriceInclVat -
+          b.financialSummary.totalPriceInclVat;
       } else if (sort.key === "customer") {
         cmp = a.customer.name.localeCompare(b.customer.name);
       } else {
         cmp = a.date - b.date;
       }
-      return sort.dir === "asc" ? cmp : -cmp;
+
+      return sort.key === "invoiceNumber"
+        ? sort.dir === "asc"
+          ? -cmp
+          : cmp
+        : sort.dir === "asc"
+          ? cmp
+          : -cmp;
     });
+
     return list;
   }, [filtered, sort]);
 
-  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
+  const totalPages = Math.max(
+    1,
+    Math.ceil(sorted.length / PAGE_SIZE),
+  );
+
   const safePage = Math.min(page, totalPages - 1);
-  const pageRows = sorted.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+
+  const pageRows = sorted.slice(
+    safePage * PAGE_SIZE,
+    (safePage + 1) * PAGE_SIZE,
+  );
+
   const hasFilters =
     !!search.trim() ||
     statusFilter !== "all" ||
@@ -280,8 +395,12 @@ export default function FinanceTransactions() {
   const handleSort = (column: SortKey) => {
     setSort((prev) => ({
       key: column,
-      dir: prev.key === column && prev.dir === "asc" ? "desc" : "asc",
+      dir:
+        prev.key === column && prev.dir === "asc"
+          ? "desc"
+          : "asc",
     }));
+
     setPage(0);
   };
 
@@ -298,10 +417,14 @@ export default function FinanceTransactions() {
     return (
       <div className="py-20 text-center">
         <TriangleAlert className="mx-auto mb-3 size-8 text-destructive" />
+
         <p className="text-sm font-medium text-foreground">
           Unable to load transactions.
         </p>
-        <p className="mt-1 text-xs text-muted-foreground">{error.message}</p>
+
+        <p className="mt-1 text-xs text-muted-foreground">
+          {error.message}
+        </p>
       </div>
     );
   }
@@ -329,6 +452,7 @@ export default function FinanceTransactions() {
           <div className="flex flex-wrap items-center gap-3">
             <div className="relative min-w-[240px] flex-1">
               <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground/70" />
+
               <Input
                 value={search}
                 onChange={(e) => {
@@ -339,6 +463,7 @@ export default function FinanceTransactions() {
                 className="h-9 border-input bg-popover pl-9 text-sm text-foreground placeholder:text-muted-foreground/70"
               />
             </div>
+
             <Select
               value={statusFilter}
               onValueChange={(v) => {
@@ -349,6 +474,7 @@ export default function FinanceTransactions() {
               <SelectTrigger className="h-9 w-[180px] border-input bg-popover text-sm text-foreground">
                 <SelectValue placeholder="Status" />
               </SelectTrigger>
+
               <SelectContent className="border-input bg-popover">
                 {STATUS_FILTERS.map((option) => (
                   <SelectItem
@@ -361,6 +487,7 @@ export default function FinanceTransactions() {
                 ))}
               </SelectContent>
             </Select>
+
             <Select
               value={dateFilter}
               onValueChange={(v) => {
@@ -371,6 +498,7 @@ export default function FinanceTransactions() {
               <SelectTrigger className="h-9 w-[180px] border-input bg-popover text-sm text-foreground">
                 <SelectValue placeholder="Date" />
               </SelectTrigger>
+
               <SelectContent className="border-input bg-popover">
                 {DATE_FILTERS.map((option) => (
                   <SelectItem
@@ -383,39 +511,49 @@ export default function FinanceTransactions() {
                 ))}
               </SelectContent>
             </Select>
+
             {dateFilter === "custom" && (
-  <div className="flex items-center gap-2">
-    <div className="w-40">
-      <EthiopianDatePicker
-        value={customFrom}
-        onChange={(value) => {
-          setCustomFrom(value);
-          setPage(0);
-        }}
-        placeholder="Start date"
-        className={customError ? "border-destructive" : ""}
-      />
-    </div>
+              <div className="flex items-center gap-2">
+                <div className="w-40">
+                  <EthiopianDatePicker
+                    value={customFrom}
+                    onChange={(value) => {
+                      setCustomFrom(value);
+                      setPage(0);
+                    }}
+                    placeholder="Start date"
+                    className={
+                      customError ? "border-destructive" : ""
+                    }
+                  />
+                </div>
 
-    <span className="text-xs text-muted-foreground/70">to</span>
+                <span className="text-xs text-muted-foreground/70">
+                  to
+                </span>
 
-    <div className="w-40">
-      <EthiopianDatePicker
-        value={customTo}
-        onChange={(value) => {
-          setCustomTo(value);
-          setPage(0);
-        }}
-        placeholder="End date"
-        className={customError ? "border-destructive" : ""}
-      />
-    </div>
+                <div className="w-40">
+                  <EthiopianDatePicker
+                    value={customTo}
+                    onChange={(value) => {
+                      setCustomTo(value);
+                      setPage(0);
+                    }}
+                    placeholder="End date"
+                    className={
+                      customError ? "border-destructive" : ""
+                    }
+                  />
+                </div>
 
-    {customError && (
-      <p className="text-xs text-destructive">{customError}</p>
-    )}
-  </div>
-)}
+                {customError && (
+                  <p className="text-xs text-destructive">
+                    {customError}
+                  </p>
+                )}
+              </div>
+            )}
+
             {hasFilters && (
               <Button
                 variant="ghost"
@@ -431,20 +569,27 @@ export default function FinanceTransactions() {
         </CardContent>
       </Card>
 
-      {/* Result counts — filtered count is NOT the all-time count */}
+      {/* Result counts */}
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
-          Showing <span className="tabular-nums text-foreground">{filtered.length}</span>{" "}
-          of <span className="tabular-nums text-foreground">{invoices?.length ?? 0}</span>{" "}
+          Showing{" "}
+          <span className="tabular-nums text-foreground">
+            {filtered.length}
+          </span>{" "}
+          of{" "}
+          <span className="tabular-nums text-foreground">
+            {invoices?.length ?? 0}
+          </span>{" "}
           transactions
           {hasFilters && " (filtered)"}
         </span>
+
         <span>
           {invoices?.length ?? 0} total invoices in the Finance dataset
         </span>
       </div>
 
-      {/* Table — one row per parent invoice, never per child order */}
+      {/* Table */}
       <Card className="border-border bg-card shadow-none">
         <CardContent className="p-0">
           {pageRows.length > 0 ? (
@@ -460,6 +605,7 @@ export default function FinanceTransactions() {
                         onSort={handleSort}
                       />
                     </th>
+
                     <th className="px-4 py-2.5 font-medium">
                       <SortButton
                         label="Customer"
@@ -468,9 +614,19 @@ export default function FinanceTransactions() {
                         onSort={handleSort}
                       />
                     </th>
-                    <th className="px-4 py-2.5 font-medium">FS No</th>
-                    <th className="px-4 py-2.5 font-medium">Orders</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Qty (m³)</th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      FS No
+                    </th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      Orders
+                    </th>
+
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Qty (m³)
+                    </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       <SortButton
                         label="Total Price"
@@ -480,8 +636,15 @@ export default function FinanceTransactions() {
                         align="right"
                       />
                     </th>
-                    <th className="px-4 py-2.5 font-medium">Bank</th>
-                    <th className="px-4 py-2.5 font-medium">Status</th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      Bank
+                    </th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      Status
+                    </th>
+
                     <th className="px-4 py-2.5 font-medium">
                       <SortButton
                         label="Date"
@@ -490,52 +653,72 @@ export default function FinanceTransactions() {
                         onSort={handleSort}
                       />
                     </th>
-                    <th className="px-4 py-2.5 text-right font-medium">Actions</th>
+
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Actions
+                    </th>
                   </tr>
                 </thead>
+
                 <tbody>
                   {pageRows.map((invoice) => {
                     const status = ORDER_STATUS_UI[invoice.status];
+
                     const totalQuantity = invoice.orders.reduce(
                       (sum, order) => sum + order.quantity,
                       0,
                     );
+
                     return (
                       <tr
                         key={invoice.id}
                         className="cursor-pointer border-b border-border transition-colors last:border-0 hover:bg-foreground/[0.03]"
                         onClick={() =>
-                          navigate(`/finance/review/detail/${invoice.id}`)
+                          navigate(
+                            `/finance/review/detail/${invoice.id}`,
+                          )
                         }
                       >
                         <td className="px-4 py-2.5 font-mono text-xs font-medium text-foreground">
                           {invoice.invoiceNumber}
                         </td>
+
                         <td className="px-4 py-2.5 text-foreground">
                           {invoice.customer.name}
                         </td>
+
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                           {invoice.fsNo || "—"}
                         </td>
+
                         <td className="px-4 py-2.5 tabular-nums text-muted-foreground">
                           {invoice.orders.length}
+
                           {invoice.orders.length > 1 && (
                             <span className="ml-1 text-[10px] text-muted-foreground/70">
-                              ({invoice.orders
+                              (
+                              {invoice.orders
                                 .map((o) => o.aggregate)
-                                .join(", ")})
+                                .join(", ")}
+                              )
                             </span>
                           )}
                         </td>
+
                         <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
                           {totalQuantity.toLocaleString()}
                         </td>
+
                         <td className="px-4 py-2.5 text-right font-medium tabular-nums text-foreground">
-                          {formatCurrency(invoice.financialSummary.totalPriceInclVat)}
+                          {formatCurrency(
+                            invoice.financialSummary.totalPriceInclVat,
+                          )}
                         </td>
+
                         <td className="px-4 py-2.5 text-muted-foreground">
                           {invoice.payment.bank || "—"}
                         </td>
+
                         <td className="px-4 py-2.5">
                           <Badge
                             variant="outline"
@@ -544,9 +727,11 @@ export default function FinanceTransactions() {
                             {status.label}
                           </Badge>
                         </td>
+
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                           {formatDate(invoice.date)}
                         </td>
+
                         <td className="px-4 py-2.5 text-right">
                           <Button
                             variant="ghost"
@@ -554,7 +739,10 @@ export default function FinanceTransactions() {
                             className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
                             onClick={(e) => {
                               e.stopPropagation();
-                              navigate(`/finance/review/detail/${invoice.id}`);
+
+                              navigate(
+                                `/finance/review/detail/${invoice.id}`,
+                              );
                             }}
                           >
                             <Eye className="size-3" />
@@ -570,14 +758,19 @@ export default function FinanceTransactions() {
           ) : (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <FileText className="mb-3 size-8 text-muted-foreground" />
+
               <p className="text-sm font-medium text-foreground">
-                {hasFilters ? "No transactions found" : "No transactions yet"}
+                {hasFilters
+                  ? "No transactions found"
+                  : "No transactions yet"}
               </p>
+
               <p className="mt-1 text-xs text-muted-foreground">
                 {hasFilters
                   ? "Try adjusting the search or filters — the whole authorized dataset is searched."
                   : "Transactions appear here once Sales creates invoices."}
               </p>
+
               {hasFilters && (
                 <Button
                   variant="ghost"
@@ -599,8 +792,13 @@ export default function FinanceTransactions() {
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <span className="tabular-nums">
             Showing {safePage * PAGE_SIZE + 1}–
-            {Math.min((safePage + 1) * PAGE_SIZE, sorted.length)} of {sorted.length}
+            {Math.min(
+              (safePage + 1) * PAGE_SIZE,
+              sorted.length,
+            )}{" "}
+            of {sorted.length}
           </span>
+
           <div className="flex items-center gap-1">
             <Button
               variant="outline"
@@ -611,26 +809,39 @@ export default function FinanceTransactions() {
             >
               <ChevronLeft className="size-3.5" />
             </Button>
-            {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => {
-              const startPage = Math.max(0, Math.min(safePage - 2, totalPages - 5));
-              const p = startPage + i;
-              if (p >= totalPages) return null;
-              return (
-                <Button
-                  key={p}
-                  variant={p === safePage ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setPage(p)}
-                  className={`h-7 w-7 p-0 text-xs ${
-                    p === safePage
-                      ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                      : "border-input bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground"
-                  }`}
-                >
-                  {p + 1}
-                </Button>
-              );
-            })}
+
+            {Array.from(
+              { length: Math.min(totalPages, 5) },
+              (_, i) => {
+                const startPage = Math.max(
+                  0,
+                  Math.min(safePage - 2, totalPages - 5),
+                );
+
+                const p = startPage + i;
+
+                if (p >= totalPages) return null;
+
+                return (
+                  <Button
+                    key={p}
+                    variant={
+                      p === safePage ? "default" : "outline"
+                    }
+                    size="sm"
+                    onClick={() => setPage(p)}
+                    className={`h-7 w-7 p-0 text-xs ${
+                      p === safePage
+                        ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                        : "border-input bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground"
+                    }`}
+                  >
+                    {p + 1}
+                  </Button>
+                );
+              },
+            )}
+
             <Button
               variant="outline"
               size="sm"

@@ -1,70 +1,72 @@
+
 /**
- * Credit Contract repository — the trusted layer for the credit workflow.
+ * Credit Contract repository — backend API implementation.
  *
- * Backend authorization:
+ * Credit contracts and credit orders are persisted by the backend.
+ * This repository does not use localStorage for credit-contract data.
  *
- *   FINANCE  create / edit drafts / activate / cancel / cancel orders /
- *            finalize (FS No + one Sales Invoice) / view everything.
+ * FINANCE:
+ *   Create / edit drafts / activate / cancel / cancel orders /
+ *   record financial information / complete credit contracts.
  *
- *   SALES    view active credit contracts / add orders to any active
- *            contract / correct orders they completed.
+ * SALES:
+ *   View active contracts / add orders / correct own completed orders.
  *
- *   OTHERS   rejected by the backend.
- *
- * This repository uses the Credit Contracts API exclusively.
- * It never reads or writes standard contract storage.
- *
- * API:
- *   GET     /api/credit-contracts
- *   GET     /api/credit-contracts/{id}
- *   POST    /api/credit-contracts
- *   PUT     /api/credit-contracts/{id}
- *   POST    /api/credit-contracts/{id}/activate
- *   POST    /api/credit-contracts/{id}/cancel
- *
- *   GET     /api/credit-contracts/{id}/orders
- *   POST    /api/credit-contracts/{id}/orders
- *   PUT     /api/credit-contracts/{id}/orders/{orderId}
- *   POST    /api/credit-contracts/{id}/orders/{orderId}/cancel
- *
- *   GET     /api/credit-contracts/{id}/payment-information
- *   PUT     /api/credit-contracts/{id}/payment-information
- *   DELETE  /api/credit-contracts/{id}/payment-information
- *
- *   GET     /api/credit-contracts/{id}/withholding
- *   PUT     /api/credit-contracts/{id}/withholding
- *
- *   GET     /api/credit-contracts/{id}/financial-report
- *   POST    /api/credit-contracts/{id}/finalize
- *
- * The backend is authoritative for authorization and lifecycle rules.
+ * IMPORTANT:
+ *   Completing a credit contract does not create a new Sales Invoice.
+ *   The backend completion endpoint must assign the FS No to the existing
+ *   individual Sales Invoices associated with the contract's orders,
+ *   save payment information, complete the contract, and freeze its orders
+ *   in one database transaction.
  */
 
 import { authRepository } from "../auth/authRepository";
+import { USER_ROLES, type AuthUser } from "../auth/types";
+import { ORDER_STATUS } from "../sales/types";
+import { salesInvoicesRepository } from "../sales/invoiceRepo";
 import { normalizeNumber } from "../sales/calc";
+import { HR_API_BASE_URL, getHrAuthToken } from "../hr/apiClient";
+
+import {
+  notifyCreditContractsChanged,
+  subscribeCreditContracts,
+} from "./storage";
 
 import {
   CREDIT_CONTRACT_STATUS,
   CREDIT_ORDER_STATUS,
   buildCreditPaymentSummary,
-  getCreditContractProgress,
+  creditContractAcceptsOrders,
+  creditRoyaltySourceKey,
+  getCreditContractTotals,
+  validateCreditContractInput,
+  validateCreditOrderInput,
   type CreditContract,
   type CreditContractInput,
   type CreditContractOrder,
   type CreditContractOrderInput,
-  type CreditContractProgress,
+  type CreditContractTotals,
+  type CreditContractStatus,
   type CreditFinalizationInput,
   type CreditPaymentSummary,
 } from "./types";
 
-import type {
-  ContractFinancialInput,
-  ContractFinancialReport,
+import type { ContractAttachment } from "../contracts/types";
+import type { SalesInvoice } from "../sales/invoice";
+
+import {
+  WITHHOLDING_RATE,
+  buildContractFinancialReport,
+  type ContractFinancialInput,
+  type ContractFinancialReport,
 } from "../contracts/financials";
 
 /* -------------------------------------------------------------------------- */
-/* Types                                                                      */
+/* API configuration                                                          */
 /* -------------------------------------------------------------------------- */
+
+const API_BASE = (HR_API_BASE_URL || "").replace(/\/+$/, "");
+const API_ROOT = "/api/credit-contracts";
 
 export class CreditContractPermissionError extends Error {
   constructor(message: string) {
@@ -73,20 +75,645 @@ export class CreditContractPermissionError extends Error {
   }
 }
 
+interface Caller {
+  id: string;
+  name: string;
+  email?: string;
+  role: string;
+}
+
+export interface CreditContractCompletionInput {
+  fsNo: string;
+  paymentAmount: number;
+  bank: string;
+  paymentSender: string;
+  paymentDate: string;
+  paymentReferenceNumber: string;
+  paymentEvidence: File | null;
+  remark?: string;
+  withholdingEnabled: boolean;
+  withholdingEvidence: File | null;
+}
+
+export interface CreditContractCompletionResult {
+  contract: CreditContract;
+  invoiceId: string;
+  invoiceNumber: string;
+  invoiceIds: string[];
+  invoiceNumbers: string[];
+}
+
 export interface CreditContractFinancials {
-  progress: CreditContractProgress;
+  totals: CreditContractTotals;
   payments: CreditPaymentSummary;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Authentication and permissions                                             */
+/* -------------------------------------------------------------------------- */
+
+function sessionCaller(action: string): Caller {
+  const session = authRepository.getSession();
+
+  if (!session || session.isGuest) {
+    throw new CreditContractPermissionError(
+      `Sign in with an authorized account to ${action}.`,
+    );
+  }
+
+  const user: AuthUser = session.user;
+
+  if (user.accountStatus === "DISABLED") {
+    throw new CreditContractPermissionError(
+      "This account is disabled. Contact an administrator.",
+    );
+  }
+
+  return {
+    id: user.id,
+    name: user.name || user.email || "User",
+    email: user.email,
+    role: user.role,
+  };
+}
+
+function requireFinance(action: string): Caller {
+  const caller = sessionCaller(action);
+
+  if (caller.role !== USER_ROLES.FINANCE) {
+    throw new CreditContractPermissionError(
+      `Only Finance can ${action}.`,
+    );
+  }
+
+  return caller;
+}
+
+function requireSales(action: string): Caller {
+  const caller = sessionCaller(action);
+
+  if (caller.role !== USER_ROLES.SALES) {
+    throw new CreditContractPermissionError(
+      `Only Sales can ${action}.`,
+    );
+  }
+
+  return caller;
+}
+
+function requireSalesOrFinance(action: string): Caller {
+  const caller = sessionCaller(action);
+
+  if (
+    caller.role !== USER_ROLES.SALES &&
+    caller.role !== USER_ROLES.FINANCE
+  ) {
+    throw new CreditContractPermissionError(
+      `Only Sales or Finance can ${action}.`,
+    );
+  }
+
+  return caller;
+}
+
+function actorLabel(caller: Caller): string {
+  return caller.email || caller.name;
+}
+
+/* -------------------------------------------------------------------------- */
+/* API request helpers                                                        */
+/* -------------------------------------------------------------------------- */
+
+function getAccessToken(): string {
+  const token = getHrAuthToken();
+
+  if (!token) {
+    throw new CreditContractPermissionError(
+      "Your session has expired. Please sign in again.",
+    );
+  }
+
+  return token;
+}
+
+function getErrorMessage(
+  payload: unknown,
+  fallback: string,
+): string {
+  if (typeof payload === "string" && payload.trim()) {
+    return payload;
+  }
+
+  if (payload && typeof payload === "object") {
+    const data = payload as Record<string, unknown>;
+
+    if (typeof data.message === "string" && data.message.trim()) {
+      return data.message;
+    }
+
+    if (typeof data.error === "string" && data.error.trim()) {
+      return data.error;
+    }
+
+    if (data.errors && typeof data.errors === "object") {
+      const errors = data.errors as Record<string, unknown>;
+
+      for (const value of Object.values(errors)) {
+        if (typeof value === "string" && value.trim()) {
+          return value;
+        }
+
+        if (Array.isArray(value) && typeof value[0] === "string") {
+          return value[0];
+        }
+      }
+    }
+  }
+
+  return fallback;
+}
+
+function unwrapData<T>(payload: unknown): T {
+  if (
+    payload &&
+    typeof payload === "object" &&
+    "data" in payload
+  ) {
+    return (payload as { data: T }).data;
+  }
+
+  return payload as T;
+}
+
+async function apiRequest<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  if (!API_BASE) {
+    throw new Error("The backend API URL is not configured.");
+  }
+
+  const token = getAccessToken();
+  const headers = new Headers(options.headers);
+
+  headers.set("Accept", "application/json");
+  headers.set("Authorization", `Bearer ${token}`);
+
+  const isFormData =
+    typeof FormData !== "undefined" &&
+    options.body instanceof FormData;
+
+  if (!isFormData && options.body !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(
+    `${API_BASE}${API_ROOT}${path}`,
+    {
+      ...options,
+      headers,
+    },
+  );
+
+  const responseText = await response.text();
+
+  let payload: unknown = null;
+
+  if (responseText.trim()) {
+    try {
+      payload = JSON.parse(responseText);
+    } catch {
+      if (response.ok) {
+        throw new Error(
+          "The backend returned an invalid response.",
+        );
+      }
+
+      payload = responseText;
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      getErrorMessage(
+        payload,
+        `Credit contract request failed (${response.status}).`,
+      ),
+    );
+  }
+
+  if (
+    payload &&
+    typeof payload === "object" &&
+    "success" in payload &&
+    (payload as { success?: boolean }).success === false
+  ) {
+    throw new Error(
+      getErrorMessage(
+        payload,
+        "The credit contract request could not be completed.",
+      ),
+    );
+  }
+
+  return unwrapData<T>(payload);
+}
+
+function jsonBody(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function firstError(
+  errors: Record<string, string>,
+  fallback: string,
+): string {
+  return Object.values(errors)[0] ?? fallback;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Response normalization                                                      */
+/* -------------------------------------------------------------------------- */
+
+type ApiRecord = Record<string, unknown>;
+
+function asApiRecord(raw: unknown): ApiRecord {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+
+  return raw as ApiRecord;
+}
+
+
+function normalizeContract(raw: unknown): CreditContract {
+  const value = asApiRecord(raw);
+
+  const rawCustomer = asApiRecord(value.customer);
+
+  const customer = {
+    ...rawCustomer,
+    name: String(
+      rawCustomer.name ??
+        value.customerName ??
+        value.customer_name ??
+        "",
+    ),
+    tin: String(
+      rawCustomer.tin ??
+        value.tin ??
+        "",
+    ),
+  };
+
+  const contractId = String(value.id ?? "");
+
+  let rawAttachments: unknown[] = [];
+
+  if (Array.isArray(value.attachments)) {
+    rawAttachments = value.attachments;
+  } else if (typeof value.attachments === "string") {
+    try {
+      const parsed = JSON.parse(value.attachments);
+      rawAttachments = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      rawAttachments = [];
+    }
+  }
+
+  const attachments = rawAttachments
+    .map((item): ContractAttachment | null => {
+      // Backend currently stores attachment UUIDs as strings.
+      if (typeof item === "string") {
+        const attachmentId = item.trim();
+
+        if (!attachmentId || attachmentId === "undefined") {
+          return null;
+        }
+
+        return {
+          id: attachmentId,
+          fileName: "Contract Attachment",
+          mimeType: "",
+          fileSize: 0,
+          fileUrl:
+            `/api/credit-contracts/${encodeURIComponent(contractId)}` +
+            `/attachments/${encodeURIComponent(attachmentId)}`,
+        };
+      }
+
+      // Also support attachment objects returned by the backend.
+      const attachment = asApiRecord(item);
+
+      const attachmentId = String(
+        attachment.id ??
+          attachment.attachmentId ??
+          attachment.attachment_id ??
+          "",
+      );
+
+      if (!attachmentId || attachmentId === "undefined") {
+        return null;
+      }
+
+      return {
+        id: attachmentId,
+        fileName: String(
+          attachment.fileName ??
+            attachment.file_name ??
+            "Contract Attachment",
+        ),
+        mimeType: String(
+          attachment.mimeType ??
+            attachment.mime_type ??
+            "application/octet-stream",
+        ),
+        fileSize: Number(
+          attachment.fileSize ??
+            attachment.file_size ??
+            0,
+        ),
+        fileUrl: String(
+          attachment.fileUrl ??
+            attachment.file_url ??
+            (
+              `/api/credit-contracts/${encodeURIComponent(contractId)}` +
+              `/attachments/${encodeURIComponent(attachmentId)}`
+            ),
+        ),
+      };
+    })
+    .filter(
+      (attachment): attachment is ContractAttachment =>
+        attachment !== null,
+    );
+
+  const statusHistory = Array.isArray(
+    value.statusHistory ?? value.status_history,
+  )
+    ? value.statusHistory ?? value.status_history
+    : [];
+
+  return {
+    ...value,
+    id: contractId,
+    contractNumber: String(
+      value.contractNumber ??
+        value.contract_number ??
+        "",
+    ),
+    customer: customer as CreditContract["customer"],
+    fsNo: String(value.fsNo ?? value.fs_no ?? ""),
+    contractDate: String(
+      value.contractDate ??
+        value.contract_date ??
+        "",
+    ),
+    attachments:
+      attachments as CreditContract["attachments"],
+    status: String(
+      value.status ?? CREDIT_CONTRACT_STATUS.DRAFT,
+    ) as CreditContractStatus,
+    createdAt: Number(
+      value.createdAt ??
+        value.created_at ??
+        0,
+    ),
+    updatedAt: Number(
+      value.updatedAt ??
+        value.updated_at ??
+        0,
+    ),
+    statusHistory:
+      statusHistory as CreditContract["statusHistory"],
+  } as unknown as CreditContract;
+}
+
+
+function normalizeOrder(raw: unknown): CreditContractOrder {
+  const value = asApiRecord(raw);
+
+  const id = String(value.id ?? "");
+
+  return {
+    ...value,
+    id,
+    creditContractId: String(
+      value.creditContractId ??
+        value.credit_contract_id ??
+        "",
+    ),
+    orderNumber: Number(
+      value.orderNumber ??
+        value.order_number ??
+        0,
+    ),
+    aggregate:
+      value.aggregate as CreditContractOrder["aggregate"],
+    quantity: normalizeNumber(value.quantity),
+    unit: String(value.unit ?? "m³"),
+    unitPrice: normalizeNumber(
+      value.unitPrice ?? value.unit_price,
+    ),
+    lineTotalExclVat: normalizeNumber(
+      value.lineTotalExclVat ??
+        value.line_total_excl_vat,
+    ),
+    lineTotalInclVat: normalizeNumber(
+      value.lineTotalInclVat ??
+        value.line_total_incl_vat,
+    ),
+    royaltyInvoiceNumber: String(
+      value.royaltyInvoiceNumber ??
+        value.royalty_invoice_number ??
+        "",
+    ),
+    orderDate: String(
+      value.orderDate ??
+        value.order_date ??
+        "",
+    ),
+    status: String(
+      value.status ?? CREDIT_ORDER_STATUS.COMPLETED,
+    ) as CreditContractOrder["status"],
+    royaltySourceKey: String(
+      value.royaltySourceKey ??
+        value.royalty_source_key ??
+        creditRoyaltySourceKey(id),
+    ),
+  } as unknown as CreditContractOrder;
+}
+
+function normalizeContracts(raw: unknown): CreditContract[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeContract);
+}
+
+function normalizeOrders(raw: unknown): CreditContractOrder[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(normalizeOrder);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Attachment normalization                                                    */
+/* -------------------------------------------------------------------------- */
+
+function normalizeAttachment(
+  raw: unknown,
+  contractId: string,
+): ContractAttachment {
+  const value = asApiRecord(raw);
+
+  const id = String(
+    value.id ??
+      value.attachmentId ??
+      value.attachment_id ??
+      "",
+  );
+
+  const fileName = String(
+    value.fileName ??
+      value.file_name ??
+      "",
+  );
+
+  const mimeType = String(
+    value.mimeType ??
+      value.mime_type ??
+      "",
+  );
+
+  const fileSize = normalizeNumber(
+    value.fileSize ??
+      value.file_size ??
+      0,
+  );
+
+  const suppliedUrl = String(
+    value.fileUrl ??
+      value.file_url ??
+      "",
+  );
+
+  return {
+    id,
+    fileName,
+    mimeType,
+    fileSize,
+    fileUrl:
+      suppliedUrl ||
+      (id
+        ? `${API_ROOT}/${encodeURIComponent(contractId)}/attachments/${encodeURIComponent(id)}`
+        : ""),
+  } as ContractAttachment;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Validation                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function validateCompletionInput(
+  input: CreditContractCompletionInput,
+  minimumPaymentAmount: number,
+): void {
+  if (!input.fsNo?.trim()) {
+    throw new Error("FS No is required.");
+  }
+
+  if (!input.bank?.trim()) {
+    throw new Error("Bank is required.");
+  }
+
+  if (!input.paymentSender?.trim()) {
+    throw new Error("Payment sender is required.");
+  }
+
+  if (!input.paymentDate?.trim()) {
+    throw new Error("Payment date is required.");
+  }
+
+  if (!input.paymentReferenceNumber?.trim()) {
+    throw new Error("Payment reference number is required.");
+  }
+
+  if (!input.paymentEvidence) {
+    throw new Error("Payment evidence is required.");
+  }
+
+  const amount = normalizeNumber(input.paymentAmount);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Enter a valid payment amount.");
+  }
+
+  if (amount < minimumPaymentAmount) {
+    throw new Error(
+      `Payment amount cannot be less than ${minimumPaymentAmount.toLocaleString()}.`,
+    );
+  }
+
+  if (
+    input.withholdingEnabled &&
+    !input.withholdingEvidence
+  ) {
+    throw new Error(
+      "Withholding evidence is required when withholding is enabled.",
+    );
+  }
+}
+
+function toCompletionFormData(
+  input: CreditContractCompletionInput,
+  caller: Caller,
+): FormData {
+  const formData = new FormData();
+
+  formData.append("fsNo", input.fsNo.trim());
+  formData.append(
+    "paymentAmount",
+    String(normalizeNumber(input.paymentAmount)),
+  );
+  formData.append("bank", input.bank.trim());
+  formData.append("paymentSender", input.paymentSender.trim());
+  formData.append("paymentDate", input.paymentDate);
+  formData.append(
+    "paymentReferenceNumber",
+    input.paymentReferenceNumber.trim(),
+  );
+  formData.append(
+    "withholdingEnabled",
+    String(input.withholdingEnabled),
+  );
+  formData.append("remark", input.remark?.trim() ?? "");
+  formData.append("completedBy", actorLabel(caller));
+
+  if (input.paymentEvidence) {
+    formData.append(
+      "paymentEvidence",
+      input.paymentEvidence,
+      input.paymentEvidence.name,
+    );
+  }
+
+  if (input.withholdingEnabled && input.withholdingEvidence) {
+    formData.append(
+      "withholdingEvidence",
+      input.withholdingEvidence,
+      input.withholdingEvidence.name,
+    );
+  }
+
+  return formData;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Repository contract                                                         */
+/* -------------------------------------------------------------------------- */
+
 export interface CreditContractsRepository {
   getContracts(): Promise<CreditContract[]>;
-
   getContractById(id: string): Promise<CreditContract | null>;
-
   getOrders(contractId: string): Promise<CreditContractOrder[]>;
-
   getAllOrders(): Promise<CreditContractOrder[]>;
-
   getOrderById(id: string): Promise<CreditContractOrder | null>;
 
   getFinancials(
@@ -102,14 +729,17 @@ export interface CreditContractsRepository {
     input: ContractFinancialInput,
   ): Promise<CreditContract>;
 
-  createContract(
-    input: CreditContractInput,
-  ): Promise<CreditContract>;
+  createContract(input: CreditContractInput): Promise<CreditContract>;
 
   updateContract(
     id: string,
     input: CreditContractInput,
   ): Promise<CreditContract>;
+
+  uploadAttachment(
+    contractId: string,
+    file: File,
+  ): Promise<ContractAttachment>;
 
   activateContract(id: string): Promise<CreditContract>;
 
@@ -120,12 +750,8 @@ export interface CreditContractsRepository {
 
   finalizeContract(
     id: string,
-    input: CreditFinalizationInput,
-  ): Promise<{
-    contract: CreditContract;
-    invoiceId: string;
-    invoiceNumber: string;
-  }>;
+    input: CreditContractCompletionInput | CreditFinalizationInput,
+  ): Promise<CreditContractCompletionResult>;
 
   addOrder(
     contractId: string,
@@ -146,1016 +772,522 @@ export interface CreditContractsRepository {
 }
 
 /* -------------------------------------------------------------------------- */
-/* API configuration                                                          */
-/* -------------------------------------------------------------------------- */
-
-type ApiObject = Record<string, unknown>;
-
-interface ApiErrorPayload {
-  message?: string;
-  error?: string;
-  errors?: Record<string, string | string[]>;
-}
-
-interface ApiEnvelope<T> {
-  success?: boolean;
-  message?: string;
-  data?: T;
-  errors?: Record<string, string | string[]>;
-}
-
-function getApiBaseUrl(): string {
-  const env = import.meta.env as Record<string, string | undefined>;
-
-  const configuredUrl =
-    env.VITE_API_URL ||
-    env.VITE_API_BASE_URL ||
-    "";
-
-  const normalized = configuredUrl.replace(/\/+$/, "");
-
-  if (!normalized) {
-    return "/api/credit-contracts";
-  }
-
-  if (/\/api$/i.test(normalized)) {
-    return `${normalized}/credit-contracts`;
-  }
-
-  return `${normalized}/api/credit-contracts`;
-}
-
-/**
- * Reads the access token from the existing authentication session.
- *
- * The backend expects:
- * Authorization: Bearer <token>
- *
- * The helper supports common session token property names so that the
- * repository does not depend on one specific session representation.
- */
-function getAccessToken(): string {
-  const session = authRepository.getSession() as unknown as
-    | ApiObject
-    | null;
-
-  if (!session) {
-    throw new CreditContractPermissionError(
-      "Your session has expired. Please sign in again.",
-    );
-  }
-
-  if (session.isGuest === true) {
-    throw new CreditContractPermissionError(
-      "Sign in with an authorized account to use credit contracts.",
-    );
-  }
-
-  const user = isObject(session.user) ? session.user : {};
-  const auth = isObject(session.auth) ? session.auth : {};
-  const tokens = isObject(session.tokens) ? session.tokens : {};
-
-  const candidates: unknown[] = [
-    session.accessToken,
-    session.token,
-    session.authToken,
-    session.access_token,
-    session.sessionToken,
-
-    user.accessToken,
-    user.token,
-    user.access_token,
-
-    auth.accessToken,
-    auth.token,
-    auth.access_token,
-
-    tokens.accessToken,
-    tokens.token,
-    tokens.access_token,
-  ];
-
-  const token = candidates.find(
-    (candidate): candidate is string =>
-      typeof candidate === "string" && candidate.trim().length > 0,
-  );
-
-  if (!token) {
-    throw new CreditContractPermissionError(
-      "Authentication token not found. Please sign out and sign in again.",
-    );
-  }
-
-  return token.trim();
-}
-
-/* -------------------------------------------------------------------------- */
-/* Generic helpers                                                            */
-/* -------------------------------------------------------------------------- */
-
-function isObject(value: unknown): value is ApiObject {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value)
-  );
-}
-
-function asObject(value: unknown): ApiObject {
-  return isObject(value) ? value : {};
-}
-
-function asString(
-  value: unknown,
-  fallback = "",
-): string {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (typeof value === "number") {
-    return String(value);
-  }
-
-  return fallback;
-}
-
-function asOptionalString(
-  value: unknown,
-): string | undefined {
-  if (value === null || value === undefined || value === "") {
-    return undefined;
-  }
-
-  return asString(value);
-}
-
-function asNumber(
-  value: unknown,
-  fallback = 0,
-): number {
-  const parsed = Number(value);
-
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function asBoolean(
-  value: unknown,
-  fallback = false,
-): boolean {
-  if (typeof value === "boolean") {
-    return value;
-  }
-
-  if (value === 1 || value === "1" || value === "true") {
-    return true;
-  }
-
-  if (value === 0 || value === "0" || value === "false") {
-    return false;
-  }
-
-  return fallback;
-}
-
-function asArray<T = unknown>(value: unknown): T[] {
-  return Array.isArray(value) ? (value as T[]) : [];
-}
-
-function unwrapData<T>(response: unknown): T {
-  if (!isObject(response)) {
-    return response as T;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(response, "data")) {
-    return response.data as T;
-  }
-
-  return response as T;
-}
-
-function extractErrorMessage(
-  payload: unknown,
-  fallback: string,
-): string {
-  if (!isObject(payload)) {
-    return fallback;
-  }
-
-  const errorPayload = payload as ApiErrorPayload;
-
-  if (typeof errorPayload.message === "string") {
-    return errorPayload.message;
-  }
-
-  if (typeof errorPayload.error === "string") {
-    return errorPayload.error;
-  }
-
-  if (isObject(errorPayload.errors)) {
-    const messages = Object.values(errorPayload.errors)
-      .flatMap((value) =>
-        Array.isArray(value) ? value : [value],
-      )
-      .filter(
-        (value): value is string =>
-          typeof value === "string" && value.length > 0,
-      );
-
-    if (messages.length > 0) {
-      return messages[0];
-    }
-  }
-
-  return fallback;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Date conversion                                                            */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Converts an epoch-millisecond UI date into the API date format.
- *
- * The backend accepts YYYY-MM-DD.
- * Local date components are used to avoid timezone date shifts.
- */
-function toApiDate(value: number | string | null | undefined): string {
-  if (value === null || value === undefined || value === "") {
-    return "";
-  }
-
-  if (typeof value === "string") {
-    const dateOnly = value.match(/^(\d{4}-\d{2}-\d{2})/);
-
-    if (dateOnly) {
-      return dateOnly[1];
-    }
-
-    const parsed = new Date(value);
-
-    if (Number.isNaN(parsed.getTime())) {
-      return "";
-    }
-
-    return formatLocalDate(parsed);
-  }
-
-  const date = new Date(value);
-
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-
-  return formatLocalDate(date);
-}
-
-function formatLocalDate(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
-}
-
-/**
- * API dates are converted into epoch milliseconds for the existing UI types.
- *
- * Date-only values are parsed as local dates to avoid displaying the previous
- * day in timezones behind UTC.
- */
-function fromApiDate(value: unknown): number {
-  if (typeof value === "number") {
-    return value;
-  }
-
-  if (typeof value !== "string" || !value.trim()) {
-    return Date.now();
-  }
-
-  const text = value.trim();
-  const dateOnly = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-
-  if (dateOnly) {
-    const [, year, month, day] = dateOnly;
-
-    return new Date(
-      Number(year),
-      Number(month) - 1,
-      Number(day),
-    ).getTime();
-  }
-
-  const parsed = new Date(text);
-
-  return Number.isNaN(parsed.getTime())
-    ? Date.now()
-    : parsed.getTime();
-}
-
-function optionalApiDate(
-  value: unknown,
-): number | undefined {
-  if (value === null || value === undefined || value === "") {
-    return undefined;
-  }
-
-  return fromApiDate(value);
-}
-
-/* -------------------------------------------------------------------------- */
-/* API request                                                                */
-/* -------------------------------------------------------------------------- */
-
-async function apiRequest<T>(
-  path: string,
-  options: RequestInit = {},
-): Promise<T> {
-  const token = getAccessToken();
-  const baseUrl = getApiBaseUrl();
-
-  const normalizedPath = path.replace(/^\/+/, "");
-  const url = `${baseUrl}/${normalizedPath}`;
-
-  const headers = new Headers(options.headers);
-
-  headers.set("Authorization", `Bearer ${token}`);
-  headers.set("Accept", "application/json");
-
-  if (options.body !== undefined && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  let response: Response;
-
-  try {
-    response = await fetch(url, {
-      ...options,
-      headers,
-      credentials: "omit",
-    });
-  } catch (error) {
-    throw new Error(
-      error instanceof Error
-        ? `Unable to connect to the server: ${error.message}`
-        : "Unable to connect to the server.",
-    );
-  }
-
-  const responseText = await response.text();
-
-  let payload: unknown = null;
-
-  if (responseText.trim()) {
-    try {
-      payload = JSON.parse(responseText);
-    } catch {
-      payload = responseText;
-    }
-  }
-
-  if (!response.ok) {
-    const message = extractErrorMessage(
-      payload,
-      `Request failed with status ${response.status}.`,
-    );
-
-    if (response.status === 401 || response.status === 403) {
-      throw new CreditContractPermissionError(message);
-    }
-
-    throw new Error(message);
-  }
-
-  if (isObject(payload)) {
-    const envelope = payload as ApiEnvelope<T>;
-
-    if (envelope.success === false) {
-      throw new Error(
-        extractErrorMessage(
-          payload,
-          "The server rejected the request.",
-        ),
-      );
-    }
-
-    if (Object.prototype.hasOwnProperty.call(payload, "data")) {
-      return envelope.data as T;
-    }
-  }
-
-  return payload as T;
-}
-
-function jsonBody(value: unknown): string {
-  return JSON.stringify(value);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Contract mapping                                                           */
-/* -------------------------------------------------------------------------- */
-
-function mapContract(rawValue: unknown): CreditContract {
-  const raw = asObject(rawValue);
-  const customer = asObject(raw.customer);
-
-  const status = asString(
-    raw.status,
-    CREDIT_CONTRACT_STATUS.DRAFT,
-  ) as CreditContract["status"];
-
-  const attachments = asArray(raw.attachments);
-
-  return {
-    id: asString(raw.id),
-
-    contractNumber: asString(raw.contractNumber),
-
-    customer: {
-      name: asString(customer.name),
-      tin: asString(customer.tin),
-    },
-
-    contractValue: normalizeNumber(
-      asNumber(raw.contractValue),
-    ),
-
-    fsNo: asString(raw.fsNo),
-
-    contractDate: fromApiDate(raw.contractDate),
-
-    attachments: attachments as CreditContract["attachments"],
-
-    remark: asOptionalString(raw.remark),
-
-    status,
-
-    createdBy: asOptionalString(raw.createdBy),
-
-    activatedBy: asOptionalString(raw.activatedBy),
-
-    activatedAt: optionalApiDate(raw.activatedAt),
-
-    finalizedBy: asOptionalString(raw.finalizedBy),
-
-    finalizedAt: optionalApiDate(raw.finalizedAt),
-
-    finalizationReason: asOptionalString(
-      raw.finalizationReason,
-    ),
-
-    cancelledBy: asOptionalString(raw.cancelledBy),
-
-    cancelledAt: optionalApiDate(raw.cancelledAt),
-
-    cancellationReason: asOptionalString(
-      raw.cancellationReason,
-    ),
-
-    closedBelowValue:
-      raw.closedBelowValue === null ||
-      raw.closedBelowValue === undefined
-        ? undefined
-        : asBoolean(raw.closedBelowValue),
-
-    salesInvoiceId: asOptionalString(raw.salesInvoiceId),
-
-    salesInvoiceNumber: asOptionalString(
-      raw.salesInvoiceNumber,
-    ),
-
-    createdAt: fromApiDate(raw.createdAt),
-
-    updatedAt: fromApiDate(raw.updatedAt),
-
-    version: asNumber(raw.version, 1),
-
-    // The current API contract mapper does not expose statusHistory.
-    statusHistory: [],
-  } as CreditContract;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Order mapping                                                              */
-/* -------------------------------------------------------------------------- */
-
-function mapOrder(rawValue: unknown): CreditContractOrder {
-  const raw = asObject(rawValue);
-
-  const id = asString(raw.id);
-
-  const completedByUserId = asString(
-    raw.completedByUserId,
-    asString(raw.completedByName),
-  );
-
-  const completedByName = asString(
-    raw.completedByName,
-    completedByUserId,
-  );
-
-  const createdAt = fromApiDate(raw.createdAt);
-
-  const cancelledAt = optionalApiDate(raw.cancelledAt);
-
-  return {
-    id,
-
-    creditContractId: asString(raw.creditContractId),
-
-    orderNumber: asNumber(raw.orderNumber),
-
-    aggregate: asString(
-      raw.aggregate,
-    ) as CreditContractOrder["aggregate"],
-
-    quantity: normalizeNumber(
-      asNumber(raw.quantity),
-    ),
-
-    unit: asString(raw.unit, "m³"),
-
-    unitPrice: normalizeNumber(
-      asNumber(raw.unitPrice),
-    ),
-
-    lineTotalExclVat: normalizeNumber(
-      asNumber(raw.lineTotalExclVat),
-    ),
-
-    lineTotalInclVat: normalizeNumber(
-      asNumber(raw.lineTotalInclVat),
-    ),
-
-    royaltyInvoiceNumber: asOptionalString(
-      raw.royaltyInvoiceNumber,
-    ),
-
-    orderDate: fromApiDate(raw.orderDate),
-
-    status: asString(
-      raw.status,
-      CREDIT_ORDER_STATUS.COMPLETED,
-    ) as CreditContractOrder["status"],
-
-    completedByUserId,
-
-    completedByName,
-
-    completedByEmail: asOptionalString(
-      raw.completedByEmail,
-    ),
-
-    // The backend mapper does not expose completedAt separately.
-    completedAt: optionalApiDate(raw.completedAt) ?? createdAt,
-
-    // The backend mapper does not expose the original creator separately.
-    createdByUserId: asString(
-      raw.createdByUserId,
-      completedByUserId,
-    ),
-
-    createdByName: asString(
-      raw.createdByName,
-      completedByName,
-    ),
-
-    createdAt,
-
-    updatedAt: fromApiDate(raw.updatedAt),
-
-    lastEditedByUserId: asOptionalString(
-      raw.lastEditedByUserId,
-    ),
-
-    lastEditedByName: asOptionalString(
-      raw.lastEditedByName,
-    ),
-
-    lastEditedByEmail: asOptionalString(
-      raw.lastEditedByEmail,
-    ),
-
-    editedAt: optionalApiDate(raw.editedAt),
-
-    cancelledAt,
-
-    cancelledBy: asOptionalString(raw.cancelledBy),
-
-    cancelReason: asOptionalString(
-      raw.cancellationReason ?? raw.cancelReason,
-    ),
-
-    // This is the source key convention used by the backend.
-    royaltySourceKey: `credit-contract-order:${id}`,
-  } as CreditContractOrder;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Financial information mapping                                              */
-/* -------------------------------------------------------------------------- */
-
-function mapPaymentInformation(
-  rawValue: unknown,
-): ContractFinancialReport["payment"] {
-  if (!rawValue || !isObject(rawValue)) {
-    return undefined;
-  }
-
-  const raw = rawValue;
-
-  return {
-    bank: asString(raw.bank),
-
-    paymentSender: asString(raw.paymentSender),
-
-    paymentAmount: normalizeNumber(
-      asNumber(raw.paymentAmount),
-    ),
-
-    paymentDate: optionalApiDate(raw.paymentDate),
-
-    paymentReferenceNumber: asString(
-      raw.paymentReferenceNumber,
-    ),
-
-    paymentEvidence: raw.paymentEvidence
-      ? (raw.paymentEvidence as NonNullable<
-          NonNullable<ContractFinancialReport["payment"]>
-        >["paymentEvidence"])
-      : undefined,
-
-    remark: asOptionalString(raw.remark),
-
-    recordedBy: asOptionalString(raw.recordedBy),
-
-    recordedAt: optionalApiDate(raw.recordedAt),
-
-    updatedAt: optionalApiDate(raw.updatedAt),
-  } as ContractFinancialReport["payment"];
-}
-
-function mapWithholdingInformation(
-  rawValue: unknown,
-): ContractFinancialReport["withholding"] {
-  if (!rawValue || !isObject(rawValue)) {
-    return undefined;
-  }
-
-  const raw = rawValue;
-
-  return {
-    enabled: asBoolean(raw.enabled),
-
-    rate: asNumber(raw.rate),
-
-    evidence: raw.evidence
-      ? (raw.evidence as NonNullable<
-          ContractFinancialReport["withholding"]
-        >["evidence"])
-      : undefined,
-
-    recordedBy: asOptionalString(raw.recordedBy),
-
-    recordedAt: optionalApiDate(raw.recordedAt),
-
-    updatedAt: optionalApiDate(raw.updatedAt),
-  } as ContractFinancialReport["withholding"];
-}
-
-function mapPaymentStatus(value: unknown): ContractFinancialReport["paymentStatus"] {
-  const status = asString(value);
-
-  const allowed: ContractFinancialReport["paymentStatus"][] = [
-    "NO_PAYMENT_INFORMATION",
-    "RECORDED_NOT_CONFIRMED",
-    "AWAITING_INVOICE_APPROVAL",
-    "AWAITING_PAYMENT_CONFIRMATION",
-    "PAID",
-    "INVOICE_UNAVAILABLE",
-  ];
-
-  return allowed.includes(
-    status as ContractFinancialReport["paymentStatus"],
-  )
-    ? (status as ContractFinancialReport["paymentStatus"])
-    : "NO_PAYMENT_INFORMATION";
-}
-
-function mapWithholdingStatus(
-  value: unknown,
-): ContractFinancialReport["withholdingStatus"] {
-  const status = asString(value);
-
-  if (status === "APPLIED" || status === "PENDING_INVOICE") {
-    return status;
-  }
-
-  return "NOT_APPLIED";
-}
-
-/* -------------------------------------------------------------------------- */
-/* Financial report mapping                                                   */
-/* -------------------------------------------------------------------------- */
-
-function mapFinancialReport(
-  rawValue: unknown,
-): ContractFinancialReport {
-  const raw = asObject(rawValue);
-
-  const invoiceRaw = isObject(raw.invoice)
-    ? raw.invoice
-    : null;
-
-  const paymentRaw = isObject(raw.payment)
-    ? raw.payment
-    : null;
-
-  const withholdingRaw = isObject(raw.withholding)
-    ? raw.withholding
-    : null;
-
-  const invoiceStatus = invoiceRaw
-    ? asString(invoiceRaw.status)
-    : undefined;
-
-  const invoiceApproved =
-    invoiceStatus === "FINANCE_APPROVED" ||
-    invoiceStatus === "PAYMENT_CONFIRMED";
-
-  const paymentConfirmed =
-    invoiceRaw !== null &&
-    asBoolean(invoiceRaw.paymentConfirmed);
-
-  const withholdingEnabled = asBoolean(
-    raw.withholdingEnabled,
-  );
-
-  const invoice = invoiceRaw
-    ? {
-        id: asString(invoiceRaw.id),
-        invoiceNumber: asString(invoiceRaw.invoiceNumber),
-        status: invoiceStatus as NonNullable<
-          ContractFinancialReport["invoice"]
-        >["status"],
-        approved: invoiceApproved,
-        paymentConfirmed,
-      }
-    : undefined;
-
-  const fulfilledValue = normalizeNumber(
-    asNumber(raw.fulfilledValue),
-  );
-
-  const contractValue = normalizeNumber(
-    asNumber(raw.contractValue),
-  );
-
-  const closedBelowValue =
-    raw.closedBelowValue !== null &&
-    raw.closedBelowValue !== undefined
-      ? asBoolean(raw.closedBelowValue)
-      : fulfilledValue < contractValue;
-
-  const report = {
-    contractNumber: asString(raw.contractNumber),
-
-    customerName: asString(raw.customerName),
-
-    customerTin: asString(raw.customerTin),
-
-    contractDate: fromApiDate(raw.contractDate),
-
-    completionDate: optionalApiDate(
-      raw.completionDate,
-    ),
-
-    fsNo: asString(raw.fsNo),
-
-    remark: asOptionalString(raw.remark),
-
-    contractValue,
-
-    fulfilledValue,
-
-    remainingContractValue: normalizeNumber(
-      asNumber(raw.remainingContractValue),
-    ),
-
-    overFulfilled: asBoolean(raw.overFulfilled),
-
-    fulfillmentPercent: asNumber(
-      raw.fulfillmentPercent,
-    ),
-
-    rawFulfillmentPercent: asNumber(
-      raw.rawFulfillmentPercent,
-    ),
-
-    closedBelowValue,
-
-    closingReason: asOptionalString(
-      raw.closingReason ?? raw.finalizationReason,
-    ),
-
-    grossAmountDue: normalizeNumber(
-      asNumber(raw.grossAmountDue),
-    ),
-
-    // The API uses the invoice amount when an invoice exists.
-    grossAmountDueBasis: invoice
-      ? "INVOICE"
-      : "COMPLETED_ORDERS",
-
-    totalVat: normalizeNumber(
-      asNumber(raw.totalVat),
-    ),
-
-    subtotalExclVat: normalizeNumber(
-      asNumber(raw.subtotalExclVat),
-    ),
-
-    withholdingEnabled,
-
-    withholdingRate: asNumber(
-      raw.withholdingRate,
-    ),
-
-    withholdingAmount: normalizeNumber(
-      asNumber(raw.withholdingAmount),
-    ),
-
-    netAmount: normalizeNumber(
-      asNumber(raw.netAmount),
-    ),
-
-    amountPaid: normalizeNumber(
-      asNumber(raw.amountPaid),
-    ),
-
-    outstandingBalance: normalizeNumber(
-      asNumber(raw.outstandingBalance),
-    ),
-
-    paymentStatus: mapPaymentStatus(
-      raw.paymentStatus,
-    ),
-
-    withholdingStatus: mapWithholdingStatus(
-      raw.withholdingStatus,
-    ),
-
-    payment: mapPaymentInformation(paymentRaw),
-
-    withholding: mapWithholdingInformation(
-      withholdingRaw,
-    ),
-
-    // The current backend financial-report endpoint does not return
-    // payment history.
-    paymentHistory: [],
-
-    invoice,
-
-    invoiceError: asOptionalString(raw.invoiceError),
-
-    paymentConfirmedAt: optionalApiDate(
-      raw.paymentConfirmedAt,
-    ),
-
-    paymentConfirmedBy: asOptionalString(
-      raw.paymentConfirmedBy,
-    ),
-  } as ContractFinancialReport;
-
-  return report;
-}
-
-/* -------------------------------------------------------------------------- */
-/* API request payload mapping                                                */
-/* -------------------------------------------------------------------------- */
-
-function mapContractInput(
-  input: CreditContractInput,
-): ApiObject {
-  return {
-    customerName: input.customerName.trim(),
-
-    tin: input.tin.trim(),
-
-    contractValue: normalizeNumber(
-      input.contractValue,
-    ),
-
-    fsNo: input.fsNo?.trim() ?? "",
-
-    contractDate: toApiDate(input.contractDate),
-
-    attachments: input.attachments ?? [],
-
-    remark: input.remark?.trim() ?? "",
-  };
-}
-
-function mapOrderInput(
-  input: CreditContractOrderInput,
-): ApiObject {
-  return {
-    aggregate: input.aggregate,
-
-    quantity: normalizeNumber(input.quantity),
-
-    unit: "m³",
-
-    unitPrice: normalizeNumber(input.unitPrice),
-
-    royaltyInvoiceNumber:
-      input.royaltyInvoiceNumber.trim(),
-
-    orderDate: toApiDate(input.orderDate),
-  };
-}
-
-/* -------------------------------------------------------------------------- */
-/* API-backed repository                                                      */
+/* API repository                                                              */
 /* -------------------------------------------------------------------------- */
 
 export class ApiCreditContractsRepository
   implements CreditContractsRepository
 {
-  private listeners = new Set<() => void>();
-
-  private notify(): void {
-    this.listeners.forEach((listener) => {
-      try {
-        listener();
-      } catch (error) {
-        console.error(
-          "Credit contract subscriber error:",
-          error,
-        );
-      }
-    });
-  }
-
-  subscribe(listener: () => void): () => void {
-    this.listeners.add(listener);
-
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  /* ---------------------------------------------------------------------- */
-  /* Contracts                                                              */
-  /* ---------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------ */
+  /* Reads                                                                    */
+  /* ------------------------------------------------------------------------ */
 
   async getContracts(): Promise<CreditContract[]> {
     const response = await apiRequest<unknown>("", {
       method: "GET",
     });
 
-    const rows = asArray(unwrapData<unknown>(response));
-
-    return rows
-      .map(mapContract)
-      .sort((a, b) => b.createdAt - a.createdAt);
+    return normalizeContracts(response).sort(
+      (a, b) => b.createdAt - a.createdAt,
+    );
   }
 
   async getContractById(
     id: string,
   ): Promise<CreditContract | null> {
-    if (!id) return null;
+    try {
+      const response = await apiRequest<unknown>(
+        `/${encodeURIComponent(id)}`,
+        { method: "GET" },
+      );
+
+      return normalizeContract(response);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.toLowerCase().includes("not found")
+      ) {
+        return null;
+      }
+
+      throw error;
+    }
+  }
+
+  async getOrders(
+    contractId: string,
+  ): Promise<CreditContractOrder[]> {
+    const response = await apiRequest<unknown>(
+      `/${encodeURIComponent(contractId)}/orders`,
+      { method: "GET" },
+    );
+
+    return normalizeOrders(response).sort(
+      (a, b) => a.orderNumber - b.orderNumber,
+    );
+  }
+
+  /**
+   * Retrieve all orders using the existing contract-specific orders route.
+   */
+  async getAllOrders(): Promise<CreditContractOrder[]> {
+    const contracts = await this.getContracts();
+
+    const ordersByContract = await Promise.all(
+      contracts.map((contract) => this.getOrders(contract.id)),
+    );
+
+    return ordersByContract
+      .flat()
+      .sort((a, b) => a.orderNumber - b.orderNumber);
+  }
+
+  async getOrderById(
+    id: string,
+  ): Promise<CreditContractOrder | null> {
+    const orders = await this.getAllOrders();
+
+    return orders.find((order) => order.id === id) ?? null;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Credit contract attachments                                              */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Upload a paper contract attachment to the credit-contract-specific
+   * attachment endpoint.
+   *
+   * This does not use the Sales Invoice attachment endpoint.
+   *
+   * Backend endpoint:
+   * POST /api/credit-contracts/{contractId}/attachments
+   *
+   * FormData field:
+   * file
+   */
+  async uploadAttachment(
+    contractId: string,
+    file: File,
+  ): Promise<ContractAttachment> {
+    requireFinance("upload credit contract attachments");
+
+    if (!contractId.trim()) {
+      throw new Error("Credit contract ID is required.");
+    }
+
+    if (!(file instanceof File)) {
+      throw new Error("Select a valid attachment file.");
+    }
+
+    const formData = new FormData();
+
+    formData.append("file", file, file.name);
 
     const response = await apiRequest<unknown>(
-      `/${encodeURIComponent(id)}`,
+      `/${encodeURIComponent(contractId)}/attachments`,
       {
-        method: "GET",
+        method: "POST",
+        body: formData,
       },
     );
 
-    const data = unwrapData<unknown>(response);
+    const attachment = normalizeAttachment(
+      response,
+      contractId,
+    );
 
-    if (!data) {
-      return null;
+    if (!attachment.id) {
+      throw new Error(
+        "The backend uploaded the file but did not return an attachment ID.",
+      );
     }
 
-    return mapContract(data);
+    notifyCreditContractsChanged();
+
+    return attachment;
   }
+
+  /* ------------------------------------------------------------------------ */
+  /* Financial information                                                    */
+  /* ------------------------------------------------------------------------ */
+
+  async getFinancials(
+    contractId: string,
+  ): Promise<CreditContractFinancials | null> {
+    const contract = await this.getContractById(contractId);
+
+    if (!contract) return null;
+
+    const [orders, invoices] = await Promise.all([
+      this.getOrders(contractId),
+      salesInvoicesRepository.getInvoices(),
+    ]);
+
+    const totals = getCreditContractTotals(orders);
+
+    const linkedInvoices = getInvoicesForCreditContract(
+      contractId,
+      orders,
+      invoices,
+    );
+
+    const amountDue = linkedInvoices.reduce(
+      (sum, invoice) => sum + invoiceAmountDue(invoice),
+      0,
+    );
+
+    const allApproved =
+      linkedInvoices.length > 0 &&
+      linkedInvoices.every(invoiceIsApproved);
+
+    const allPaymentConfirmed =
+      linkedInvoices.length > 0 &&
+      linkedInvoices.every(
+        (invoice) =>
+          invoice.status === ORDER_STATUS.PAYMENT_CONFIRMED,
+      );
+
+    const payments = buildCreditPaymentSummary({
+      invoiceNumber: linkedInvoices
+        .map((invoice) => invoice.invoiceNumber)
+        .filter(Boolean)
+        .join(", "),
+      invoiceStatus: allPaymentConfirmed
+        ? ORDER_STATUS.PAYMENT_CONFIRMED
+        : allApproved
+          ? ORDER_STATUS.FINANCE_APPROVED
+          : linkedInvoices[0]?.status,
+      invoiceApproved: allApproved,
+      amountDue,
+      paymentConfirmed: allPaymentConfirmed,
+      paymentConfirmedAt:
+        linkedInvoices.length > 0
+          ? linkedInvoices
+              .map((invoice) => invoice.paymentConfirmedAt)
+              .filter(Boolean)
+              .sort()
+              .slice(-1)[0]
+          : undefined,
+    });
+
+    return {
+      totals,
+      payments,
+    };
+  }
+
+  async getFinancialReport(
+  contractId: string,
+): Promise<ContractFinancialReport | null> {
+  const contract = await this.getContractById(contractId);
+
+  if (!contract) return null;
+
+  const [
+    orders,
+    invoices,
+    financialResponse,
+  ] = await Promise.all([
+    this.getOrders(contractId),
+    salesInvoicesRepository.getInvoices(),
+    apiRequest<unknown>(
+      `/${encodeURIComponent(contractId)}/financial-report`,
+      { method: "GET" },
+    ),
+  ]);
+
+  const financialData = asApiRecord(financialResponse);
+
+  const completed = orders.filter(
+    (order) => order.status === CREDIT_ORDER_STATUS.COMPLETED,
+  );
+
+  const totals = getCreditContractTotals(completed);
+
+  const linkedInvoices = getInvoicesForCreditContract(
+    contractId,
+    orders,
+    invoices,
+  );
+
+  const invoice = linkedInvoices[0] ?? null;
+
+  /**
+   * Convert backend date values into the timestamp format
+   * expected by the frontend financial report.
+   */
+  const normalizeFinancialDate = (
+    value: unknown,
+  ): number | undefined => {
+    if (value === null || value === undefined || value === "") {
+      return undefined;
+    }
+
+    if (typeof value === "number") {
+      return value;
+    }
+
+    const timestamp = Date.parse(String(value));
+
+    return Number.isNaN(timestamp) ? undefined : timestamp;
+  };
+
+  /**
+   * Normalize evidence returned by attachmentDetails().
+   * Preserve the backend-provided file URL.
+   */
+  const normalizeFinancialEvidence = (
+    raw: unknown,
+  ): NonNullable<
+    NonNullable<ContractFinancialReport["payment"]>["paymentEvidence"]
+  > | undefined => {
+    if (!raw || typeof raw !== "object") {
+      return undefined;
+    }
+
+    const evidence = asApiRecord(raw);
+
+    return {
+      ...evidence,
+      id: String(
+        evidence.id ??
+          evidence.attachmentId ??
+          evidence.attachment_id ??
+          "",
+      ),
+      fileName: String(
+        evidence.fileName ??
+          evidence.file_name ??
+          "",
+      ),
+      mimeType: String(
+        evidence.mimeType ??
+          evidence.mime_type ??
+          "",
+      ),
+      fileSize: normalizeNumber(
+        evidence.fileSize ??
+          evidence.file_size ??
+          0,
+      ),
+      fileUrl: String(
+        evidence.fileUrl ??
+          evidence.file_url ??
+          "",
+      ),
+    } as NonNullable<
+      NonNullable<ContractFinancialReport["payment"]>["paymentEvidence"]
+    >;
+  };
+
+  const rawPayment = asApiRecord(financialData.payment);
+  const rawWithholding = asApiRecord(financialData.withholding);
+
+  const payment = financialData.payment
+    ? {
+        bank: String(rawPayment.bank ?? ""),
+        paymentSender: String(
+          rawPayment.paymentSender ??
+            rawPayment.payment_sender ??
+            "",
+        ),
+        paymentAmount: normalizeNumber(
+          rawPayment.paymentAmount ??
+            rawPayment.payment_amount ??
+            0,
+        ),
+        paymentDate: normalizeFinancialDate(
+          rawPayment.paymentDate ??
+            rawPayment.payment_date,
+        ),
+        paymentReferenceNumber: String(
+          rawPayment.paymentReferenceNumber ??
+            rawPayment.payment_reference_number ??
+            "",
+        ),
+        paymentEvidence: normalizeFinancialEvidence(
+          rawPayment.paymentEvidence ??
+            rawPayment.evidence,
+        ),
+        remark: String(rawPayment.remark ?? ""),
+        recordedBy: String(
+          rawPayment.recordedBy ??
+            rawPayment.recorded_by ??
+            "",
+        ),
+        recordedAt: normalizeFinancialDate(
+          rawPayment.recordedAt ??
+            rawPayment.recorded_at,
+        ),
+        updatedAt: normalizeFinancialDate(
+          rawPayment.updatedAt ??
+            rawPayment.updated_at,
+        ),
+      }
+    : undefined;
+
+  const withholding = financialData.withholding
+    ? {
+        enabled: Boolean(rawWithholding.enabled),
+        rate: normalizeNumber(
+          rawWithholding.rate ?? WITHHOLDING_RATE,
+        ),
+        evidence: normalizeFinancialEvidence(
+          rawWithholding.evidence,
+        ),
+        recordedBy: String(
+          rawWithholding.recordedBy ??
+            rawWithholding.recorded_by ??
+            "",
+        ),
+        recordedAt: normalizeFinancialDate(
+          rawWithholding.recordedAt ??
+            rawWithholding.recorded_at,
+        ),
+        updatedAt: normalizeFinancialDate(
+          rawWithholding.updatedAt ??
+            rawWithholding.updated_at,
+        ),
+      }
+    : undefined;
+
+  const report = buildContractFinancialReport({
+    contract: {
+      ...contract,
+      contractValue: 0,
+      finalizedAt: contract.finalizedAt,
+      payment,
+      withholding,
+    },
+    completedOrders: completed.map((order) => ({
+      quantity: order.quantity,
+      unitPrice: order.unitPrice,
+    })),
+    fulfilledValue: totals.fulfilledValue,
+    remainingValue: 0,
+    invoice,
+    invoiceError:
+      contract.status === CREDIT_CONTRACT_STATUS.INVOICED &&
+      linkedInvoices.length === 0
+        ? "This completed credit contract has no linked Sales Invoices."
+        : undefined,
+  });
+
+  return {
+    ...report,
+    payment,
+    withholding,
+  };
+}
+
+  async saveFinancialInformation(
+    contractId: string,
+    input: ContractFinancialInput,
+  ): Promise<CreditContract> {
+    requireFinance(
+      "record credit contract payment and withholding information",
+    );
+
+    const formData = new FormData();
+
+    if (input.payment === null) {
+      formData.append("clearPayment", "true");
+    } else if (input.payment) {
+      const paymentEvidence = input.payment.paymentEvidence;
+
+      formData.append(
+        "payment",
+        JSON.stringify({
+          ...input.payment,
+          paymentEvidence:
+            typeof File !== "undefined" &&
+            paymentEvidence instanceof File
+              ? undefined
+              : paymentEvidence,
+        }),
+      );
+
+      if (
+        typeof File !== "undefined" &&
+        paymentEvidence instanceof File
+      ) {
+        formData.append(
+          "paymentEvidence",
+          paymentEvidence,
+          paymentEvidence.name,
+        );
+      }
+    }
+
+    if (input.withholding) {
+      formData.append(
+        "withholding",
+        JSON.stringify({
+          enabled: input.withholding.enabled,
+          rate: input.withholding.enabled ? WITHHOLDING_RATE : 0,
+        }),
+      );
+
+      const withholdingEvidence = input.withholding.evidence;
+
+      if (
+        typeof File !== "undefined" &&
+        withholdingEvidence instanceof File
+      ) {
+        formData.append(
+          "withholdingEvidence",
+          withholdingEvidence,
+          withholdingEvidence.name,
+        );
+      }
+    }
+
+    const response = await apiRequest<unknown>(
+      `/${encodeURIComponent(contractId)}/financial-information`,
+      {
+        method: "POST",
+        body: formData,
+      },
+    );
+
+    const updated = normalizeContract(response);
+    notifyCreditContractsChanged();
+
+    return updated;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Finance — contract lifecycle                                             */
+  /* ------------------------------------------------------------------------ */
 
   async createContract(
     input: CreditContractInput,
   ): Promise<CreditContract> {
+    const caller = requireFinance("create credit contracts");
+
+    const validation = validateCreditContractInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Contract is incomplete."),
+      );
+    }
+
     const response = await apiRequest<unknown>("", {
       method: "POST",
-      body: jsonBody(mapContractInput(input)),
+      body: jsonBody({
+        customerName: input.customerName.trim(),
+        tin: input.tin.trim(),
+        contractDate: input.contractDate,
+        attachments: input.attachments ?? [],
+        remark: input.remark?.trim() || undefined,
+        createdBy: actorLabel(caller),
+      }),
     });
 
-    const contract = mapContract(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const contract = normalizeContract(response);
+    notifyCreditContractsChanged();
 
     return contract;
   }
@@ -1164,38 +1296,51 @@ export class ApiCreditContractsRepository
     id: string,
     input: CreditContractInput,
   ): Promise<CreditContract> {
+    requireFinance("edit credit contracts");
+
+    const validation = validateCreditContractInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Contract is incomplete."),
+      );
+    }
+
     const response = await apiRequest<unknown>(
       `/${encodeURIComponent(id)}`,
       {
         method: "PUT",
-        body: jsonBody(mapContractInput(input)),
+        body: jsonBody({
+          customerName: input.customerName.trim(),
+          tin: input.tin.trim(),
+          contractDate: input.contractDate,
+          attachments: input.attachments,
+          remark: input.remark?.trim() || undefined,
+        }),
       },
     );
 
-    const contract = mapContract(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const contract = normalizeContract(response);
+    notifyCreditContractsChanged();
 
     return contract;
   }
 
-  async activateContract(
-    id: string,
-  ): Promise<CreditContract> {
+  async activateContract(id: string): Promise<CreditContract> {
+    const caller = requireFinance("activate credit contracts");
+
     const response = await apiRequest<unknown>(
       `/${encodeURIComponent(id)}/activate`,
       {
         method: "POST",
+        body: jsonBody({
+          activatedBy: actorLabel(caller),
+        }),
       },
     );
 
-    const contract = mapContract(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const contract = normalizeContract(response);
+    notifyCreditContractsChanged();
 
     return contract;
   }
@@ -1204,6 +1349,7 @@ export class ApiCreditContractsRepository
     id: string,
     reason: string,
   ): Promise<CreditContract> {
+    const caller = requireFinance("cancel credit contracts");
     const reasonText = reason?.trim();
 
     if (!reasonText) {
@@ -1216,81 +1362,179 @@ export class ApiCreditContractsRepository
         method: "POST",
         body: jsonBody({
           reason: reasonText,
+          cancelledBy: actorLabel(caller),
         }),
       },
     );
 
-    const contract = mapContract(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const contract = normalizeContract(response);
+    notifyCreditContractsChanged();
 
     return contract;
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Orders                                                                 */
-  /* ---------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------ */
+  /* Finance — complete credit contract                                       */
+  /* ------------------------------------------------------------------------ */
 
-  async getOrders(
-    contractId: string,
-  ): Promise<CreditContractOrder[]> {
-    const response = await apiRequest<unknown>(
-      `/${encodeURIComponent(contractId)}/orders`,
+  async finalizeContract(
+    id: string,
+    input: CreditContractCompletionInput | CreditFinalizationInput,
+  ): Promise<CreditContractCompletionResult> {
+    const caller = requireFinance("complete credit contracts");
+
+    if (!("paymentAmount" in input)) {
+      throw new Error(
+        "Credit contract completion requires the payment amount, bank, sender, payment date, reference, and payment evidence.",
+      );
+    }
+
+    const contract = await this.getContractById(id);
+
+    if (!contract) {
+      throw new Error("Credit contract not found.");
+    }
+
+    if (contract.status === CREDIT_CONTRACT_STATUS.CANCELLED) {
+      throw new Error(
+        "A cancelled credit contract cannot be completed.",
+      );
+    }
+
+    if (contract.status === CREDIT_CONTRACT_STATUS.DRAFT) {
+      throw new Error(
+        "Activate the credit contract before completing it.",
+      );
+    }
+
+    if (contract.status === CREDIT_CONTRACT_STATUS.INVOICED) {
+      throw new Error(
+        "This credit contract has already been completed.",
+      );
+    }
+
+    const orders = await this.getOrders(id);
+
+    const completedOrders = orders.filter(
+      (order) => order.status === CREDIT_ORDER_STATUS.COMPLETED,
+    );
+
+    if (completedOrders.length === 0) {
+      throw new Error(
+        "This credit contract has no completed orders.",
+      );
+    }
+
+    const totals = getCreditContractTotals(completedOrders);
+    const minimumPaymentAmount = totals.fulfilledValue;
+
+    validateCompletionInput(input, minimumPaymentAmount);
+
+    /*
+     * The backend must perform this operation atomically:
+     *
+     * 1. Lock the credit contract and its orders.
+     * 2. Confirm it is still active and accepting completion.
+     * 3. Confirm all completed orders have their existing individual
+     *    Sales Invoices.
+     * 4. Assign the supplied FS No to those existing invoices.
+     * 5. Save payment and withholding information.
+     * 6. Mark the credit contract completed.
+     * 7. Prevent any further order creation or modification.
+     *
+     * This endpoint must NOT create a new consolidated Sales Invoice.
+     */
+    const response = await apiRequest<{
+      contract: unknown;
+      invoices?: Array<{
+        id: string;
+        invoiceNumber: string;
+      }>;
+      invoiceIds?: string[];
+      invoiceNumbers?: string[];
+    }>(
+      `/${encodeURIComponent(id)}/complete`,
       {
-        method: "GET",
+        method: "POST",
+        body: toCompletionFormData(input, caller),
       },
     );
 
-    const rows = asArray(unwrapData<unknown>(response));
-
-    return rows
-      .map(mapOrder)
-      .sort((a, b) => a.orderNumber - b.orderNumber);
-  }
-
-  async getAllOrders(): Promise<CreditContractOrder[]> {
-    const contracts = await this.getContracts();
-
-    const orderGroups = await Promise.all(
-      contracts.map((contract) =>
-        this.getOrders(contract.id),
-      ),
+    const completedContract = normalizeContract(
+      response.contract,
     );
 
-    return orderGroups
-      .flat()
-      .sort((a, b) => b.createdAt - a.createdAt);
+    const invoiceIds =
+      response.invoiceIds ??
+      response.invoices?.map((invoice) => invoice.id) ??
+      [];
+
+    const invoiceNumbers =
+      response.invoiceNumbers ??
+      response.invoices?.map((invoice) => invoice.invoiceNumber) ??
+      [];
+
+    notifyCreditContractsChanged();
+
+    return {
+      contract: completedContract,
+      invoiceId: invoiceIds[0] ?? "",
+      invoiceNumber: invoiceNumbers[0] ?? "",
+      invoiceIds,
+      invoiceNumbers,
+    };
   }
 
-  async getOrderById(
-    id: string,
-  ): Promise<CreditContractOrder | null> {
-    if (!id) return null;
-
-    const orders = await this.getAllOrders();
-
-    return orders.find((order) => order.id === id) ?? null;
-  }
+  /* ------------------------------------------------------------------------ */
+  /* Sales — credit contract orders                                           */
+  /* ------------------------------------------------------------------------ */
 
   async addOrder(
     contractId: string,
     input: CreditContractOrderInput,
   ): Promise<CreditContractOrder> {
+    const caller = requireSales("add credit contract orders");
+
+    const contract = await this.getContractById(contractId);
+
+    if (!contract) {
+      throw new Error("Credit contract not found.");
+    }
+
+    if (!creditContractAcceptsOrders(contract.status)) {
+      throw new Error(
+        "This credit contract is not accepting orders. It may be a draft, cancelled, or already completed.",
+      );
+    }
+
+    const validation = validateCreditOrderInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Order is incomplete."),
+      );
+    }
+
     const response = await apiRequest<unknown>(
       `/${encodeURIComponent(contractId)}/orders`,
       {
         method: "POST",
-        body: jsonBody(mapOrderInput(input)),
+        body: jsonBody({
+          aggregate: input.aggregate,
+          quantity: normalizeNumber(input.quantity),
+          unit: "m³",
+          unitPrice: normalizeNumber(input.unitPrice),
+          royaltyInvoiceNumber: input.royaltyInvoiceNumber.trim(),
+          orderDate: input.orderDate,
+          completedByUserId: caller.id,
+          completedByName: caller.name,
+          completedByEmail: caller.email,
+        }),
       },
     );
 
-    const order = mapOrder(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const order = normalizeOrder(response);
+    notifyCreditContractsChanged();
 
     return order;
   }
@@ -1299,7 +1543,18 @@ export class ApiCreditContractsRepository
     orderId: string,
     input: CreditContractOrderInput,
   ): Promise<CreditContractOrder> {
-    // The API route requires both contractId and orderId.
+    const caller = requireSalesOrFinance(
+      "correct credit contract orders",
+    );
+
+    const validation = validateCreditOrderInput(input);
+
+    if (!validation.valid) {
+      throw new Error(
+        firstError(validation.errors, "Order is incomplete."),
+      );
+    }
+
     const existingOrder = await this.getOrderById(orderId);
 
     if (!existingOrder) {
@@ -1307,19 +1562,24 @@ export class ApiCreditContractsRepository
     }
 
     const response = await apiRequest<unknown>(
-      `/${encodeURIComponent(existingOrder.creditContractId)}` +
-        `/orders/${encodeURIComponent(orderId)}`,
+      `/${encodeURIComponent(existingOrder.creditContractId)}/orders/${encodeURIComponent(orderId)}`,
       {
         method: "PUT",
-        body: jsonBody(mapOrderInput(input)),
+        body: jsonBody({
+          aggregate: input.aggregate,
+          quantity: normalizeNumber(input.quantity),
+          unitPrice: normalizeNumber(input.unitPrice),
+          royaltyInvoiceNumber: input.royaltyInvoiceNumber.trim(),
+          orderDate: input.orderDate,
+          editedByUserId: caller.id,
+          editedByName: caller.name,
+          editedByEmail: caller.email,
+        }),
       },
     );
 
-    const order = mapOrder(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const order = normalizeOrder(response);
+    notifyCreditContractsChanged();
 
     return order;
   }
@@ -1328,13 +1588,13 @@ export class ApiCreditContractsRepository
     orderId: string,
     reason: string,
   ): Promise<CreditContractOrder> {
+    const caller = requireFinance("cancel credit contract orders");
     const reasonText = reason?.trim();
 
     if (!reasonText) {
       throw new Error("A cancellation reason is required.");
     }
 
-    // The API route requires both contractId and orderId.
     const existingOrder = await this.getOrderById(orderId);
 
     if (!existingOrder) {
@@ -1342,288 +1602,102 @@ export class ApiCreditContractsRepository
     }
 
     const response = await apiRequest<unknown>(
-      `/${encodeURIComponent(existingOrder.creditContractId)}` +
-        `/orders/${encodeURIComponent(orderId)}/cancel`,
+      `/${encodeURIComponent(existingOrder.creditContractId)}/orders/${encodeURIComponent(orderId)}/cancel`,
       {
         method: "POST",
         body: jsonBody({
           reason: reasonText,
+          cancelledBy: actorLabel(caller),
         }),
       },
     );
 
-    const order = mapOrder(
-      unwrapData<unknown>(response),
-    );
-
-    this.notify();
+    const order = normalizeOrder(response);
+    notifyCreditContractsChanged();
 
     return order;
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Financial report                                                       */
-  /* ---------------------------------------------------------------------- */
-
-  async getFinancialReport(
-    contractId: string,
-  ): Promise<ContractFinancialReport | null> {
-    if (!contractId) return null;
-
-    const response = await apiRequest<unknown>(
-      `/${encodeURIComponent(contractId)}/financial-report`,
-      {
-        method: "GET",
-      },
-    );
-
-    const data = unwrapData<unknown>(response);
-
-    if (!data) {
-      return null;
-    }
-
-    return mapFinancialReport(data);
-  }
-
-  async getFinancials(
-    contractId: string,
-  ): Promise<CreditContractFinancials | null> {
-    const [contract, orders, report] = await Promise.all([
-      this.getContractById(contractId),
-      this.getOrders(contractId),
-      this.getFinancialReport(contractId),
-    ]);
-
-    if (!contract) {
-      return null;
-    }
-
-    const completedOrders = orders.filter(
-      (order) =>
-        order.status === CREDIT_ORDER_STATUS.COMPLETED,
-    );
-
-    const progress = getCreditContractProgress(
-      contract,
-      completedOrders,
-    );
-
-    if (!report) {
-      return {
-        progress,
-        payments: buildCreditPaymentSummary({
-          amountDue: 0,
-        }),
-      };
-    }
-
-    const invoice = report.invoice;
-
-    const payments = buildCreditPaymentSummary({
-      invoiceNumber: invoice?.invoiceNumber,
-
-      invoiceStatus: invoice?.status as
-        | Parameters<typeof buildCreditPaymentSummary>[0]["invoiceStatus"]
-        | undefined,
-
-      invoiceApproved: invoice?.approved ?? false,
-
-      amountDue: normalizeNumber(report.netAmount),
-
-      paymentConfirmed: invoice?.paymentConfirmed ?? false,
-
-      paymentConfirmedAt: report.paymentConfirmedAt,
-    });
-
-    return {
-      progress,
-      payments,
-    };
-  }
-
-  /* ---------------------------------------------------------------------- */
-  /* Payment and withholding                                                */
-  /* ---------------------------------------------------------------------- */
-
-  async saveFinancialInformation(
-    contractId: string,
-    input: ContractFinancialInput,
-  ): Promise<CreditContract> {
-    const basePath = `/${encodeURIComponent(contractId)}`;
-
-    /*
-     * The backend has separate endpoints for payment information and
-     * withholding information.
-     *
-     * These requests are intentionally sequential. They are not one
-     * database transaction, so a successful first request is not rolled
-     * back if the second request fails.
-     */
-
-    if (input.payment === null) {
-      await apiRequest<unknown>(
-        `${basePath}/payment-information`,
-        {
-          method: "DELETE",
-        },
-      );
-    } else if (input.payment) {
-      const payment = input.payment;
-
-      const paymentPayload = {
-        bank: payment.bank.trim(),
-
-        paymentSender: payment.paymentSender.trim(),
-
-        paymentAmount: normalizeNumber(
-          payment.paymentAmount,
-        ),
-
-        paymentDate: payment.paymentDate
-          ? toApiDate(payment.paymentDate)
-          : null,
-
-        paymentReferenceNumber:
-          payment.paymentReferenceNumber.trim(),
-
-        paymentEvidence: payment.paymentEvidence ?? null,
-
-        remark: payment.remark?.trim() ?? "",
-      };
-
-      await apiRequest<unknown>(
-        `${basePath}/payment-information`,
-        {
-          method: "PUT",
-          body: jsonBody(paymentPayload),
-        },
-      );
-    }
-
-    const withholdingPayload = {
-      enabled: input.withholding.enabled,
-
-      evidence: input.withholding.enabled
-        ? input.withholding.evidence ?? null
-        : input.withholding.evidence ?? null,
-    };
-
-    await apiRequest<unknown>(
-      `${basePath}/withholding`,
-      {
-        method: "PUT",
-        body: jsonBody(withholdingPayload),
-      },
-    );
-
-    const updatedContract = await this.getContractById(
-      contractId,
-    );
-
-    if (!updatedContract) {
-      throw new Error(
-        "Financial information was saved, but the credit contract could not be reloaded.",
-      );
-    }
-
-    this.notify();
-
-    return updatedContract;
-  }
-
-  /* ---------------------------------------------------------------------- */
-  /* Finalization                                                           */
-  /* ---------------------------------------------------------------------- */
-
-  async finalizeContract(
-    id: string,
-    input: CreditFinalizationInput,
-  ): Promise<{
-    contract: CreditContract;
-    invoiceId: string;
-    invoiceNumber: string;
-  }> {
-    const fsNo = input.fsNo?.trim();
-
-    if (!fsNo) {
-      throw new Error("FS No is required to finalize the contract.");
-    }
-
-    /*
-     * Finalization is handled entirely by the backend.
-     *
-     * The backend:
-     *   1. Validates completed orders.
-     *   2. Checks the FS No.
-     *   3. Creates one consolidated Sales Invoice.
-     *   4. Links the invoice to the credit contract.
-     *
-     * Do not call salesInvoicesRepository.createInvoice() here.
-     */
-
-    const response = await apiRequest<unknown>(
-      `/${encodeURIComponent(id)}/finalize`,
-      {
-        method: "POST",
-        body: jsonBody({
-          fsNo,
-          reason: input.reason?.trim() ?? "",
-        }),
-      },
-    );
-
-    const result = asObject(
-      unwrapData<unknown>(response),
-    );
-
-    const invoiceId = asString(result.invoiceId);
-    const invoiceNumber = asString(result.invoiceNumber);
-
-    if (!invoiceId || !invoiceNumber) {
-      throw new Error(
-        "The contract was finalized, but the API did not return the Sales Invoice information.",
-      );
-    }
-
-    const contract = await this.getContractById(id);
-
-    if (!contract) {
-      throw new Error(
-        "The contract was finalized, but it could not be reloaded.",
-      );
-    }
-
-    this.notify();
-
-    return {
-      contract,
-      invoiceId,
-      invoiceNumber,
-    };
+  subscribe(listener: () => void): () => void {
+    return subscribeCreditContracts(listener);
   }
 }
 
 /* -------------------------------------------------------------------------- */
-/* Single repository instance                                                 */
+/* Derived financial helpers                                                  */
 /* -------------------------------------------------------------------------- */
 
+function invoiceAmountDue(invoice: SalesInvoice): number {
+  const summary = invoice.financialSummary;
+
+  return normalizeNumber(
+    summary.withholdingEnabled
+      ? summary.netAmountAfterWithholding
+      : summary.totalPriceInclVat,
+  );
+}
+
+function invoiceIsApproved(invoice: SalesInvoice): boolean {
+  return (
+    invoice.status === ORDER_STATUS.FINANCE_APPROVED ||
+    invoice.status === ORDER_STATUS.PAYMENT_CONFIRMED
+  );
+}
+
 /**
- * All credit-contract pages and hooks should use this API-backed instance.
+ * Find the existing Sales Invoices associated with a credit contract.
  *
- * LocalCreditContractsRepository is intentionally no longer the active
- * repository. The backend is the source of truth.
+ * The preferred relationship is the credit order's salesInvoiceId.
+ * The second relationship is contractOrderId on an invoice order line.
+ *
+ * This function intentionally does not create or modify invoices.
  */
+function getInvoicesForCreditContract(
+  contractId: string,
+  orders: CreditContractOrder[],
+  invoices: SalesInvoice[],
+): SalesInvoice[] {
+  const orderIds = new Set(orders.map((order) => order.id));
+
+  return invoices.filter((invoice) => {
+    if (invoice.contractId === contractId) {
+      return true;
+    }
+
+    if (
+      orders.some(
+        (order) =>
+          "salesInvoiceId" in order &&
+          order.salesInvoiceId === invoice.id,
+      )
+    ) {
+      return true;
+    }
+
+    return (
+      invoice.orders?.some((line) => {
+        const contractOrderId = (
+          line as typeof line & {
+            contractOrderId?: string;
+          }
+        ).contractOrderId;
+
+        return Boolean(
+          contractOrderId && orderIds.has(contractOrderId),
+        );
+      }) ?? false
+    );
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Application export                                                         */
+/* -------------------------------------------------------------------------- */
+
 export const creditContractsRepository: CreditContractsRepository =
   new ApiCreditContractsRepository();
 
-/* -------------------------------------------------------------------------- */
-/* Completed orders helper                                                    */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Completed, non-cancelled orders — the royalty-eligible set.
- */
+/** Completed, non-cancelled orders — the royalty-eligible set. */
 export function completedCreditOrders(
   orders: CreditContractOrder[],
 ): CreditContractOrder[] {

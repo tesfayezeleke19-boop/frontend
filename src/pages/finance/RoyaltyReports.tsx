@@ -1,5 +1,10 @@
+import {
+  useMemo,
+  useState,
+  useEffect,
+  useCallback,
+} from "react";
 
-import { useMemo, useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -8,11 +13,11 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+
 import {
   ScrollText,
   FileText,
   Download,
-  CheckCircle2,
   Loader2,
   RefreshCw,
   AlertCircle,
@@ -31,6 +36,7 @@ import {
   ROYALTY_BATCH_STATUS,
   exportRoyaltyRowsToExcel,
   getRoyaltyFilename,
+  resolveRoyaltyAmount,
   royaltyBatchesRepository,
 } from "@/services/finance/royaltyBatches";
 
@@ -45,7 +51,10 @@ import type {
 
 /**
  * The backend is the source of truth for report rows.
- * The backend excludes rows already associated with finalized batches.
+ * The backend excludes rows already associated with completed batches.
+ *
+ * PostgreSQL automatically creates and finalizes batches when 50
+ * eligible records have been staged.
  */
 type RoyaltyRow = FinanceRoyaltyReportRow;
 
@@ -57,6 +66,7 @@ function toExportRows(rows: RoyaltyRow[]): RoyaltyExportRow[] {
     quantity: row.quantity,
     unitPrice: row.unitPrice,
     lineTotalExclVat: row.lineTotalExclVat,
+    royalty: row.royalty,
   }));
 }
 
@@ -65,19 +75,25 @@ export default function RoyaltyReports() {
     data,
     loading,
     error: reportError,
+    refresh: refreshRows,
   } = useRoyaltyReportRows();
 
   const [batches, setBatches] = useState<RoyaltyBatch[]>([]);
   const [batchesLoading, setBatchesLoading] = useState(true);
   const [batchesError, setBatchesError] = useState<string | null>(null);
+
   const [isExporting, setIsExporting] = useState(false);
+  const [downloadingBatchId, setDownloadingBatchId] = useState<string | null>(
+    null,
+  );
+
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
-  /**
-   * Batch history is loaded from the backend.
-   * No batch information is read from localStorage.
-   */
+  /* ---------------------------------------------------------------- */
+  /* Load completed batch history                                     */
+  /* ---------------------------------------------------------------- */
+
   const loadBatches = useCallback(async () => {
     setBatchesLoading(true);
     setBatchesError(null);
@@ -100,9 +116,25 @@ export default function RoyaltyReports() {
     void loadBatches();
   }, [loadBatches]);
 
+  /* ---------------------------------------------------------------- */
+  /* Refresh report and batch history                                 */
+  /* ---------------------------------------------------------------- */
+
+  const handleRefresh = useCallback(async () => {
+    setActionError(null);
+    setActionMessage(null);
+
+    refreshRows();
+    await loadBatches();
+  }, [refreshRows, loadBatches]);
+
+  /* ---------------------------------------------------------------- */
+  /* Current eligible royalty records                                 */
+  /* ---------------------------------------------------------------- */
+
   /**
-   * The backend has already removed finalized rows.
-   * Do not apply a second client-side finalized-key filter.
+   * These are the eligible records that have not yet been included
+   * in a completed batch.
    */
   const royaltyRows = useMemo<RoyaltyRow[]>(
     () => data ?? [],
@@ -110,12 +142,11 @@ export default function RoyaltyReports() {
   );
 
   const batchCount = royaltyRows.length;
-  const isFullBatch = batchCount >= ROYALTY_BATCH_SIZE;
 
   const totalRoyalty = useMemo(
     () =>
       royaltyRows.reduce(
-        (sum, row) => sum + row.royalty,
+        (sum, row) => sum + resolveRoyaltyAmount(row),
         0,
       ),
     [royaltyRows],
@@ -130,14 +161,23 @@ export default function RoyaltyReports() {
     [royaltyRows],
   );
 
+  /**
+   * Used only for the filename of a partial export.
+   * PostgreSQL generates actual batch numbers automatically.
+   */
   const nextBatchNumber =
     batches.reduce(
       (maximum, batch) => Math.max(maximum, batch.batchNumber),
       0,
     ) + 1;
 
+  /* ---------------------------------------------------------------- */
+  /* Export current eligible records                                  */
+  /* ---------------------------------------------------------------- */
+
   /**
-   * Export a snapshot without finalizing or consuming the current rows.
+   * Export a snapshot of the currently waiting records.
+   * This does not change the PostgreSQL pending queue.
    */
   const handleExportSnapshot = () => {
     if (batchCount === 0 || isExporting) return;
@@ -152,7 +192,9 @@ export default function RoyaltyReports() {
         getRoyaltyFilename(nextBatchNumber, true),
       );
 
-      setActionMessage("Royalty report exported successfully.");
+      setActionMessage(
+        "Royalty report exported successfully. The records remain available for automatic batching.",
+      );
     } catch (err: unknown) {
       setActionError(
         err instanceof Error
@@ -164,54 +206,46 @@ export default function RoyaltyReports() {
     }
   };
 
+  /* ---------------------------------------------------------------- */
+  /* Export one completed historical batch                            */
+  /* ---------------------------------------------------------------- */
+
   /**
-   * Finalize the first 50 rows through the backend.
-   *
-   * Only after the API confirms finalization do we export the batch and
-   * reload batch history. The report hook refreshes through the Finance
-   * change notifier after successful finalization.
+   * Download the exact saved records belonging to one completed batch.
+   * Does not use current report rows or current page filters.
    */
-  const handleFinalizeBatch = async () => {
-    if (!isFullBatch || isExporting) return;
+  const handleDownloadBatch = async (batch: RoyaltyBatch) => {
+    if (downloadingBatchId) return;
 
     setActionError(null);
     setActionMessage(null);
-    setIsExporting(true);
+    setDownloadingBatchId(batch.id);
 
     try {
-      const rowsToFinalize = royaltyRows.slice(
-        0,
-        ROYALTY_BATCH_SIZE,
-      );
-
-      const batch = await royaltyBatchesRepository.finalizeBatch(
-        rowsToFinalize.map((row) => row.key),
-      );
+      const rows = await royaltyBatchesRepository.getBatchRows(batch.id);
 
       exportRoyaltyRowsToExcel(
-        toExportRows(rowsToFinalize),
+        rows,
         getRoyaltyFilename(batch.batchNumber, false),
       );
 
-      await loadBatches();
-
       setActionMessage(
-        `Batch ${String(batch.batchNumber).padStart(3, "0")} finalized successfully.`,
+        `Batch ${String(batch.batchNumber).padStart(3, "0")} exported successfully (${rows.length} records).`,
       );
     } catch (err: unknown) {
       setActionError(
         err instanceof Error
           ? err.message
-          : "Unable to finalize the royalty batch.",
+          : "Unable to export the selected royalty batch.",
       );
-
-      // Refresh history in case the server completed finalization but
-      // the client encountered an error afterward.
-      await loadBatches();
     } finally {
-      setIsExporting(false);
+      setDownloadingBatchId(null);
     }
   };
+
+  /* ---------------------------------------------------------------- */
+  /* Initial loading                                                   */
+  /* ---------------------------------------------------------------- */
 
   if (loading && !data) {
     return (
@@ -221,6 +255,10 @@ export default function RoyaltyReports() {
     );
   }
 
+  /* ---------------------------------------------------------------- */
+  /* Page                                                              */
+  /* ---------------------------------------------------------------- */
+
   return (
     <div className="space-y-5">
       {/* Page Header */}
@@ -229,9 +267,13 @@ export default function RoyaltyReports() {
           Royalty Reports
         </h1>
 
+        <p className="mt-1 text-xs text-muted-foreground">
+          Eligible royalty records are automatically grouped into batches
+          of 50 by the database.
+        </p>
       </div>
 
-      {/* Report loading and error messages */}
+      {/* Report Error */}
       {reportError && (
         <div
           role="alert"
@@ -243,11 +285,15 @@ export default function RoyaltyReports() {
             <p className="font-medium">
               Unable to load royalty report rows
             </p>
-            <p className="mt-1">{reportError.message}</p>
+
+            <p className="mt-1">
+              {reportError.message}
+            </p>
           </div>
         </div>
       )}
 
+      {/* Batch History Error */}
       {batchesError && (
         <div
           role="alert"
@@ -259,7 +305,10 @@ export default function RoyaltyReports() {
             <p className="font-medium">
               Unable to load batch history
             </p>
-            <p className="mt-1">{batchesError}</p>
+
+            <p className="mt-1">
+              {batchesError}
+            </p>
           </div>
 
           <Button
@@ -273,7 +322,7 @@ export default function RoyaltyReports() {
         </div>
       )}
 
-      {/* Action feedback */}
+      {/* Action Error */}
       {actionError && (
         <div
           role="alert"
@@ -284,6 +333,7 @@ export default function RoyaltyReports() {
         </div>
       )}
 
+      {/* Action Message */}
       {actionMessage && (
         <div
           role="status"
@@ -293,53 +343,48 @@ export default function RoyaltyReports() {
         </div>
       )}
 
+      {/* Report Refreshing */}
+      {loading && data && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border border-border bg-muted/40 p-3 text-sm text-muted-foreground"
+        >
+          <Loader2 className="size-4 animate-spin" />
+          Refreshing eligible royalty records...
+        </div>
+      )}
+
       {/* Stats */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
-        <Card
-          className={`shadow-none ${
-            isFullBatch
-              ? "border-success-border bg-success-soft"
-              : "border-border bg-card"
-          }`}
-        >
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">
-                Current Royalty Batch
-              </span>
-
-              <ScrollText
-                className={`size-4 ${
-                  isFullBatch
-                    ? "text-success"
-                    : "text-violet"
-                }`}
-              />
-            </div>
-
-            <div
-              className={`mt-2 text-2xl font-bold tabular-nums ${
-                isFullBatch
-                  ? "text-success"
-                  : "text-foreground"
-              }`}
-            >
-              {batchCount} / {ROYALTY_BATCH_SIZE}
-            </div>
-
-            <div className="mt-0.5 font-mono text-[10px] text-muted-foreground/70">
-              {isFullBatch
-                ? "Batch ready — finalize to start next"
-                : `${Math.max(0, ROYALTY_BATCH_SIZE - batchCount)} more to complete batch`}
-            </div>
-          </CardContent>
-        </Card>
-
+        {/* Waiting Records */}
         <Card className="border-border bg-card shadow-none">
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-muted-foreground">
-                Total Approved Sales
+                Records Waiting
+              </span>
+
+              <ScrollText className="size-4 text-violet" />
+            </div>
+
+            <div className="mt-2 text-2xl font-bold tabular-nums text-foreground">
+              {batchCount} / {ROYALTY_BATCH_SIZE}
+            </div>
+
+            <div className="mt-0.5 font-mono text-[10px] text-muted-foreground/70">
+              {batchCount >= ROYALTY_BATCH_SIZE
+                ? "Eligible records awaiting database processing"
+                : `${ROYALTY_BATCH_SIZE - batchCount} more for the next batch`}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Total Sales */}
+        <Card className="border-border bg-card shadow-none">
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">
+                Waiting Records Sales
               </span>
             </div>
 
@@ -349,11 +394,12 @@ export default function RoyaltyReports() {
           </CardContent>
         </Card>
 
+        {/* Total Royalty */}
         <Card className="border-border bg-card shadow-none">
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-muted-foreground">
-                Total Royalty (3%)
+                Waiting Records Royalty (3%)
               </span>
             </div>
 
@@ -363,6 +409,7 @@ export default function RoyaltyReports() {
           </CardContent>
         </Card>
 
+        {/* Completed Batches */}
         <Card className="border-border bg-card shadow-none">
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
@@ -378,7 +425,7 @@ export default function RoyaltyReports() {
         </Card>
       </div>
 
-      {/* Export Actions */}
+      {/* Export and Refresh Actions */}
       <div className="flex flex-wrap items-center gap-3">
         <Button
           onClick={handleExportSnapshot}
@@ -398,47 +445,32 @@ export default function RoyaltyReports() {
           Export Excel
         </Button>
 
-        {isFullBatch && (
-          <Button
-            onClick={handleFinalizeBatch}
-            disabled={
-              isExporting ||
-              Boolean(reportError) ||
-              Boolean(batchesError)
-            }
-            className="gap-2 bg-success text-primary-foreground hover:bg-success"
-          >
-            {isExporting ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <CheckCircle2 className="size-4" />
-            )}
-
-            Finalize Batch ({ROYALTY_BATCH_SIZE})
-          </Button>
-        )}
-
         <Button
           variant="outline"
-          onClick={() => void loadBatches()}
-          disabled={batchesLoading}
+          onClick={() => void handleRefresh()}
+          disabled={batchesLoading || loading}
           className="gap-2"
         >
-          {batchesLoading ? (
+          {batchesLoading || loading ? (
             <Loader2 className="size-4 animate-spin" />
           ) : (
             <RefreshCw className="size-4" />
           )}
 
-          Refresh History
+          Refresh Data
         </Button>
+
+        <p className="text-[11px] text-muted-foreground/70">
+          PostgreSQL automatically saves every 50 eligible records.
+          Exporting does not affect the automatic batch queue.
+        </p>
       </div>
 
-      {/* Royalty Rows Table */}
+      {/* Current Eligible Royalty Records */}
       <Card className="border-border bg-card shadow-none">
         <CardHeader className="pb-3">
           <CardTitle className="text-sm font-medium text-foreground">
-            Current Batch — Eligible Royalty Orders ({batchCount})
+            Records Waiting for Automatic Batch ({batchCount})
           </CardTitle>
         </CardHeader>
 
@@ -448,22 +480,30 @@ export default function RoyaltyReports() {
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-border bg-muted text-left font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                    <th className="px-4 py-2.5 font-medium">Date</th>
+                    <th className="px-4 py-2.5 font-medium">
+                      Date
+                    </th>
+
                     <th className="px-4 py-2.5 font-medium">
                       Royalty Invoice Number
                     </th>
+
                     <th className="px-4 py-2.5 font-medium">
                       Aggregate Type
                     </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       Quantity (m³)
                     </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       Unit Price
                     </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       Total Price
                     </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       3%
                     </th>
@@ -477,7 +517,9 @@ export default function RoyaltyReports() {
                       className="border-b border-border transition-colors last:border-0 hover:bg-foreground/[0.03]"
                     >
                       <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                        {row.date == null ? "—" : formatDate(row.date)}
+                        {row.date == null
+                          ? "—"
+                          : formatDate(row.date)}
                       </td>
 
                       <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
@@ -512,7 +554,7 @@ export default function RoyaltyReports() {
                       </td>
 
                       <td className="px-4 py-2.5 text-right font-medium tabular-nums text-violet">
-                        {formatCurrency(row.royalty)}
+                        {formatCurrency(resolveRoyaltyAmount(row))}
                       </td>
                     </tr>
                   ))}
@@ -554,26 +596,40 @@ export default function RoyaltyReports() {
               {reportError ? (
                 <>
                   <AlertCircle className="mb-3 size-8 text-red-400" />
+
                   <p className="text-sm font-medium text-foreground">
                     Report data could not be loaded.
                   </p>
+
                   <p className="mt-1 max-w-md text-xs text-muted-foreground">
-                    Check your connection and sign-in session, then retry.
-                    No empty report is being treated as a successful API response.
+                    Check your connection and sign-in session, then
+                    retry. No empty report is being treated as a
+                    successful API response.
                   </p>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleRefresh()}
+                    className="mt-4 gap-2"
+                  >
+                    <RefreshCw className="size-3.5" />
+                    Retry
+                  </Button>
                 </>
               ) : (
                 <>
                   <FileText className="mb-3 size-8 text-muted-foreground" />
 
                   <p className="text-sm font-medium text-foreground">
-                    No approved sales are currently available for royalty reporting.
+                    No records are currently waiting for royalty batching.
                   </p>
 
                   <p className="mt-1 max-w-xl text-xs text-muted-foreground">
-                    Approved Sales Invoice orders and completed Contract
-                    Orders appear here when eligible. Rows already finalized
-                    into a batch are excluded by the backend.
+                    Eligible Sales Invoice records with Finance Approved
+                    or Payment Confirmed status are automatically included.
+                    Records already saved into completed batches are
+                    excluded from this list.
                   </p>
                 </>
               )}
@@ -618,16 +674,33 @@ export default function RoyaltyReports() {
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-border bg-muted text-left font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-                    <th className="px-4 py-2.5 font-medium">Batch</th>
-                    <th className="px-4 py-2.5 font-medium">Records</th>
+                    <th className="px-4 py-2.5 font-medium">
+                      Batch
+                    </th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      Records
+                    </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       Total Sales
                     </th>
+
                     <th className="px-4 py-2.5 text-right font-medium">
                       Total Royalty
                     </th>
-                    <th className="px-4 py-2.5 font-medium">Created</th>
-                    <th className="px-4 py-2.5 font-medium">Status</th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      Created
+                    </th>
+
+                    <th className="px-4 py-2.5 font-medium">
+                      Status
+                    </th>
+
+                    <th className="px-4 py-2.5 text-right font-medium">
+                      Export
+                    </th>
                   </tr>
                 </thead>
 
@@ -638,7 +711,8 @@ export default function RoyaltyReports() {
                       className="border-b border-border transition-colors last:border-0 hover:bg-foreground/[0.03]"
                     >
                       <td className="px-4 py-2.5 font-mono text-xs font-medium text-foreground">
-                        Batch {String(batch.batchNumber).padStart(3, "0")}
+                        Batch{" "}
+                        {String(batch.batchNumber).padStart(3, "0")}
                       </td>
 
                       <td className="px-4 py-2.5 tabular-nums text-muted-foreground">
@@ -661,15 +735,40 @@ export default function RoyaltyReports() {
                         <Badge
                           variant="outline"
                           className={`border text-[10px] font-medium ${
-                            batch.status === ROYALTY_BATCH_STATUS.FINALIZED
+                            batch.status ===
+                            ROYALTY_BATCH_STATUS.FINALIZED
                               ? "erp-badge-approved"
                               : "erp-badge-draft"
                           }`}
                         >
-                          {batch.status === ROYALTY_BATCH_STATUS.FINALIZED
+                          {batch.status ===
+                          ROYALTY_BATCH_STATUS.FINALIZED
                             ? "Finalized"
                             : "Pending"}
                         </Badge>
+                      </td>
+
+                      <td className="px-4 py-2.5 text-right">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            void handleDownloadBatch(batch)
+                          }
+                          disabled={
+                            downloadingBatchId === batch.id ||
+                            Boolean(downloadingBatchId)
+                          }
+                          className="h-7 gap-1.5 border-input text-xs text-foreground hover:bg-accent"
+                        >
+                          {downloadingBatchId === batch.id ? (
+                            <Loader2 className="size-3 animate-spin" />
+                          ) : (
+                            <Download className="size-3" />
+                          )}
+
+                          Export Excel
+                        </Button>
                       </td>
                     </tr>
                   ))}
@@ -685,7 +784,8 @@ export default function RoyaltyReports() {
               </p>
 
               <p className="mt-1 text-xs text-muted-foreground">
-                Finalized batches will appear here after they are saved by the backend.
+                Completed batches will appear here automatically
+                when 50 eligible records are available.
               </p>
             </div>
           )}

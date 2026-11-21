@@ -1028,8 +1028,6 @@ export default function AdminUsers() {
 
             <DialogDescription className="text-sm text-muted-foreground">
               This requests a password reset for {dialog?.account?.email}.
-              An actual reset email is sent only if the backend reset
-              workflow is configured.
             </DialogDescription>
           </DialogHeader>
 

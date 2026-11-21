@@ -3,17 +3,15 @@
  * Contract order dialog — ONE form for completing a new order under a
  * contract and for correcting an existing one.
  *
- * Aggregate types and their unit prices are fetched from the Sales API.
- * Selecting an aggregate automatically fills its database unit price.
+ * Aggregate types and unit prices are fetched from the Sales API.
+ * The fulfillment amount is VAT-inclusive and can be entered directly;
+ * quantity and amount update each other using the database unit price.
  *
- * The form captures ONLY the individual order: aggregate, quantity, unit
- * price, Royalty Invoice Number, and order date.
+ * The order's VAT-inclusive total cannot exceed the contract's available
+ * remaining value. When correcting an existing order, its current value
+ * is added back to the available amount so it is not counted twice.
  *
- * The responsible salesperson is NEVER chosen in this form — the repository
- * records the authenticated session's identity when the order is completed.
- *
- * The form body mounts only while the dialog is open, so each open starts
- * from the current order/contract state without a state-syncing effect.
+ * The responsible salesperson is recorded by the repository.
  */
 import { EthiopianDatePicker } from "@/components/ui/ethiopian-date-picker";
 import { useEffect, useState } from "react";
@@ -49,6 +47,7 @@ import {
   getSalesAggregateTypes,
   type SalesAggregateTypeOption,
 } from "@/services/sales/apiInvoiceRepo";
+import { VAT_DIVISOR } from "@/services/sales/calc";
 import { formatCurrency, formatQuantity } from "@/services/sales/format";
 
 const inputClass =
@@ -70,6 +69,7 @@ interface FormState {
   aggregate: string;
   quantity: string;
   unitPrice: string;
+  fulfillmentAmount: string;
   royaltyInvoiceNumber: string;
   orderDate: string;
 }
@@ -78,15 +78,19 @@ const EMPTY_FORM: FormState = {
   aggregate: "",
   quantity: "",
   unitPrice: "",
+  fulfillmentAmount: "",
   royaltyInvoiceNumber: "",
   orderDate: dateInputValue(),
 };
 
 function formFromOrder(order: ContractOrder): FormState {
+  const totals = calculateContractOrderTotals(order);
+
   return {
     aggregate: order.aggregate,
     quantity: String(order.quantity),
     unitPrice: String(order.unitPrice),
+    fulfillmentAmount: String(totals.lineTotalInclVat),
     royaltyInvoiceNumber: order.royaltyInvoiceNumber ?? "",
     orderDate: dateInputValue(order.orderDate),
   };
@@ -96,7 +100,6 @@ interface ContractOrderDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   contract: Contract;
-  /** Present when correcting an existing order. */
   order?: ContractOrder | null;
   onSaved: (order: ContractOrder) => void;
 }
@@ -143,11 +146,15 @@ function ContractOrderForm({
   const [aggregateTypes, setAggregateTypes] = useState<
     SalesAggregateTypeOption[]
   >([]);
+
   const [loadingAggregates, setLoadingAggregates] = useState(true);
   const [aggregateLoadError, setAggregateLoadError] = useState("");
 
-  // Load active aggregate types and their prices from the database.
-  // This form mounts only when the dialog opens.
+  // Contract capacity information.
+  const [availableContractValue, setAvailableContractValue] = useState(0);
+  const [loadingContractValue, setLoadingContractValue] = useState(true);
+  const [contractValueLoadError, setContractValueLoadError] = useState("");
+
   useEffect(() => {
     let cancelled = false;
 
@@ -191,8 +198,84 @@ function ContractOrderForm({
     };
   }, []);
 
+  // Load the contract's available value from the backend.
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadContractCapacity = async () => {
+      setLoadingContractValue(true);
+      setContractValueLoadError("");
+
+      try {
+        const progress = await contractsRepository.getContractProgress(
+          contract.id,
+        );
+
+        if (cancelled) return;
+
+        // availableValue accounts for both completed and reserved orders.
+        // remainingValue is retained as a fallback for older responses.
+        const backendAvailableValue = Number(
+          progress?.availableValue ?? progress?.remainingValue ?? 0,
+        );
+
+        if (
+          !Number.isFinite(backendAvailableValue) ||
+          backendAvailableValue < 0
+        ) {
+          throw new Error("The contract's available value is invalid.");
+        }
+
+        // During correction, the existing order is already included in
+        // the backend's completed/reserved totals. Add it back so the
+        // edited order is compared against capacity excluding itself.
+        const existingOrderValue = order
+          ? calculateContractOrderTotals(order).lineTotalInclVat
+          : 0;
+
+        setAvailableContractValue(
+          Math.max(0, backendAvailableValue + existingOrderValue),
+        );
+      } catch (error) {
+        if (cancelled) return;
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Could not load the contract's remaining value.";
+
+        setContractValueLoadError(message);
+        toast.error(`Failed to load contract balance: ${message}`);
+      } finally {
+        if (!cancelled) {
+          setLoadingContractValue(false);
+        }
+      }
+    };
+
+    void loadContractCapacity();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [contract.id, order]);
+
   const update = (field: keyof FormState, value: string) => {
-    setForm((prev) => ({ ...prev, [field]: value }));
+    setForm((prev) => {
+      const next = { ...prev, [field]: value };
+
+      // Quantity is the source value when it is edited.
+      if (field === "quantity") {
+        const quantity = parseFloat(value) || 0;
+        const unitPrice = parseFloat(prev.unitPrice) || 0;
+
+        next.fulfillmentAmount = String(
+          quantity * unitPrice * VAT_DIVISOR,
+        );
+      }
+
+      return next;
+    });
 
     setErrors((prev) => {
       if (!prev[field]) return prev;
@@ -203,24 +286,54 @@ function ContractOrderForm({
     });
   };
 
+  const handleFulfillmentAmountChange = (value: string) => {
+    setForm((prev) => {
+      const amount = parseFloat(value) || 0;
+      const unitPrice = parseFloat(prev.unitPrice) || 0;
+
+      return {
+        ...prev,
+        fulfillmentAmount: value,
+        quantity:
+          unitPrice > 0
+            ? String(amount / (unitPrice * VAT_DIVISOR))
+            : prev.quantity,
+      };
+    });
+
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next.quantity;
+      delete next.fulfillmentAmount;
+      return next;
+    });
+  };
+
   // Selecting an aggregate also selects its database-defined unit price.
   const handleAggregateChange = (aggregateName: string) => {
     const selectedAggregate = aggregateTypes.find(
       (item) => item.name === aggregateName,
     );
 
-    setForm((prev) => ({
-      ...prev,
-      aggregate: aggregateName,
-      unitPrice: selectedAggregate
-        ? String(selectedAggregate.pricePerM3)
-        : "",
-    }));
+    setForm((prev) => {
+      const unitPrice = selectedAggregate?.pricePerM3 ?? 0;
+      const quantity = parseFloat(prev.quantity) || 0;
+
+      return {
+        ...prev,
+        aggregate: aggregateName,
+        unitPrice: selectedAggregate ? String(unitPrice) : "",
+        fulfillmentAmount: String(
+          quantity * unitPrice * VAT_DIVISOR,
+        ),
+      };
+    });
 
     setErrors((prev) => {
       const next = { ...prev };
       delete next.aggregate;
       delete next.unitPrice;
+      delete next.fulfillmentAmount;
       return next;
     });
   };
@@ -230,14 +343,12 @@ function ContractOrderForm({
     quantity: parseFloat(form.quantity) || 0,
     unitPrice: parseFloat(form.unitPrice) || 0,
     royaltyInvoiceNumber: form.royaltyInvoiceNumber,
-    orderDate: new Date(`${form.orderDate}T00:00:00`).getTime(),
+    orderDate: new Date(`${form.orderDate}T12:00:00.000Z`).getTime(),
   };
 
   const totals = calculateContractOrderTotals(input);
   const isCorrection = Boolean(order);
 
-  // Keep the original aggregate visible when correcting an old order,
-  // even if it is no longer active in the database.
   const aggregateOptions = [...aggregateTypes];
 
   if (
@@ -253,57 +364,99 @@ function ContractOrderForm({
     });
   }
 
+  const fulfillmentAmount = parseFloat(form.fulfillmentAmount) || 0;
+
+  const exceedsContractValue =
+    fulfillmentAmount > availableContractValue + 0.01;
+
+  const remainingAfterOrder = Math.max(
+    0,
+    availableContractValue - fulfillmentAmount,
+  );
+
   const handleSubmit = async () => {
-    if (loadingAggregates && !isCorrection) {
-      toast.error("Please wait while aggregate types are loading.");
-      return;
-    }
+  if (loadingAggregates && !isCorrection) {
+    toast.error("Please wait while aggregate types are loading.");
+    return;
+  }
 
-    if (
-      !isCorrection &&
-      !aggregateTypes.some((item) => item.name === form.aggregate)
-    ) {
-      toast.error(
-        "Please select an active aggregate type from the database.",
-      );
-      return;
-    }
+  if (loadingContractValue) {
+    toast.error("Please wait while the contract balance is loading.");
+    return;
+  }
 
-    const parsed: ContractOrderInput = {
-      ...input,
-      orderDate: Number.isNaN(input.orderDate) ? 0 : input.orderDate,
-    };
+  if (contractValueLoadError) {
+    toast.error(
+      "The contract balance could not be verified. Please try again.",
+    );
+    return;
+  }
 
-    const validation = validateContractOrderInput(parsed);
-    setErrors(validation.errors);
+  if (
+    !isCorrection &&
+    !aggregateTypes.some((item) => item.name === form.aggregate)
+  ) {
+    toast.error("Please select an active aggregate type from the database.");
+    return;
+  }
 
-    if (!validation.valid) return;
-
-    setSaving(true);
-
-    try {
-      const saved = order
-        ? await contractsRepository.updateOrder(order.id, parsed)
-        : await contractsRepository.completeOrder(contract.id, parsed);
-
-      toast.success(
-        order
-          ? `Order ${saved.orderNumber} corrected`
-          : `Order ${saved.orderNumber} completed`,
-      );
-
-      onSaved(saved);
-      onCancel();
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Order could not be saved",
-      );
-    } finally {
-      setSaving(false);
-    }
+  const parsed: ContractOrderInput = {
+    ...input,
+    orderDate: Number.isNaN(input.orderDate) ? 0 : input.orderDate,
   };
+
+  const validation = validateContractOrderInput(parsed);
+  const nextErrors = { ...validation.errors };
+
+  if (fulfillmentAmount <= 0) {
+    nextErrors.fulfillmentAmount =
+      "Fulfillment amount must be greater than zero.";
+  }
+
+  if (
+    Number.isFinite(fulfillmentAmount) &&
+    Math.abs(fulfillmentAmount - totals.lineTotalInclVat) > 0.01
+  ) {
+    nextErrors.fulfillmentAmount =
+      "Fulfillment amount does not match the quantity and unit price.";
+  }
+
+  if (fulfillmentAmount > availableContractValue + 0.01) {
+    nextErrors.fulfillmentAmount =
+      `Order total cannot exceed the available contract value of ${formatCurrency(
+        availableContractValue,
+      )}.`;
+  }
+
+  setErrors(nextErrors);
+
+  if (Object.keys(nextErrors).length > 0) return;
+
+  setSaving(true);
+
+  try {
+    const saved = order
+      ? await contractsRepository.updateOrder(order.id, parsed)
+      : await contractsRepository.completeOrder(contract.id, parsed);
+
+    if (order) {
+      toast.success(`Order ${saved.orderNumber} corrected successfully.`);
+    } else {
+      toast.success(
+        `Order ${saved.orderNumber} created successfully and is pending Finance approval.`,
+      );
+    }
+
+    onSaved(saved);
+    onCancel();
+  } catch (error) {
+    toast.error(
+      error instanceof Error ? error.message : "Order could not be saved.",
+    );
+  } finally {
+    setSaving(false);
+  }
+};
 
   return (
     <DialogContent className="border-input bg-card sm:max-w-lg">
@@ -311,17 +464,65 @@ function ContractOrderForm({
         <DialogTitle className="text-foreground">
           {isCorrection
             ? `Correct Order ${order?.orderNumber}`
-            : "Complete Order"}
+            : "Create Contract Order"}
         </DialogTitle>
 
         <DialogDescription className="text-sm text-muted-foreground">
           {contract.contractNumber} · {contract.customer.name} · FS No{" "}
-          {contract.fsNo}. Customer, contract value, and the paper contract stay
-          on the parent contract.
+          {contract.fsNo}. 
         </DialogDescription>
       </DialogHeader>
 
       <div className="space-y-3">
+        {/* Contract remaining value */}
+        <div className="rounded-lg border border-border bg-sidebar p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
+                Available Contract Value
+              </p>
+
+              <p className="mt-1 text-base font-semibold tabular-nums text-foreground">
+                {loadingContractValue ? (
+                  <span className="inline-flex items-center gap-2 text-sm font-normal text-muted-foreground">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Loading contract balance...
+                  </span>
+                ) : contractValueLoadError ? (
+                  <span className="text-sm text-destructive">
+                    Could not load balance
+                  </span>
+                ) : (
+                  formatCurrency(availableContractValue)
+                )}
+              </p>
+            </div>
+
+            {!loadingContractValue && !contractValueLoadError && (
+              <div className="text-right">
+                <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
+                  After This Order
+                </p>
+                <p
+                  className={`mt-1 text-sm font-semibold tabular-nums ${
+                    exceedsContractValue
+                      ? "text-destructive"
+                      : "text-foreground"
+                  }`}
+                >
+                  {formatCurrency(remainingAfterOrder)}
+                </p>
+              </div>
+            )}
+          </div>
+
+          {contractValueLoadError && (
+            <p className="mt-2 text-xs text-destructive">
+              {contractValueLoadError}
+            </p>
+          )}
+        </div>
+
         <div className="grid grid-cols-2 gap-3">
           {/* Aggregate type */}
           <div>
@@ -346,10 +547,7 @@ function ContractOrderForm({
 
               <SelectContent className="border-input bg-popover">
                 {aggregateOptions.map((aggregate) => (
-                  <SelectItem
-                    key={aggregate.id}
-                    value={aggregate.name}
-                  >
+                  <SelectItem key={aggregate.id} value={aggregate.name}>
                     {aggregate.name}
                   </SelectItem>
                 ))}
@@ -444,6 +642,42 @@ function ContractOrderForm({
           </div>
         </div>
 
+        {/* VAT-inclusive fulfillment amount */}
+        <div>
+          <Label className="text-xs text-muted-foreground">
+            Fulfillment Amount (ETB, VAT-inclusive) *
+          </Label>
+
+          <Input
+            inputMode="decimal"
+            value={form.fulfillmentAmount}
+            onChange={(e) =>
+              handleFulfillmentAmountChange(e.target.value)
+            }
+            placeholder="Enter amount or quantity above"
+            className={`${inputClass} mt-1 ${
+              exceedsContractValue ? "border-destructive" : ""
+            }`}
+          />
+
+          {errors.fulfillmentAmount && (
+            <p className="mt-1 text-xs text-destructive">
+              {errors.fulfillmentAmount}
+            </p>
+          )}
+
+          {exceedsContractValue && !errors.fulfillmentAmount && (
+            <p className="mt-1 text-xs text-destructive">
+              This amount exceeds the available contract value.
+            </p>
+          )}
+
+          <p className="mt-1 text-[10px] text-muted-foreground/70">
+            Entering an amount recalculates quantity using the selected
+            aggregate unit price and 15% VAT.
+          </p>
+        </div>
+
         {/* Royalty invoice number */}
         <div>
           <Label className="text-xs text-muted-foreground">
@@ -480,10 +714,14 @@ function ContractOrderForm({
 
           <div>
             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground/70">
-              Fulfillment value (VAT-incl)
+              Fulfillment Value (VAT-incl)
             </div>
 
-            <div className="mt-1 text-sm font-medium tabular-nums text-foreground">
+            <div
+              className={`mt-1 text-sm font-medium tabular-nums ${
+                exceedsContractValue ? "text-destructive" : "text-foreground"
+              }`}
+            >
               {formatCurrency(totals.lineTotalInclVat)}
             </div>
           </div>
@@ -526,16 +764,21 @@ function ContractOrderForm({
           onClick={handleSubmit}
           disabled={
             saving ||
+            loadingContractValue ||
+            Boolean(contractValueLoadError) ||
             (loadingAggregates && !isCorrection) ||
-            (!isCorrection && aggregateTypes.length === 0)
+            (!isCorrection && aggregateTypes.length === 0) ||
+            exceedsContractValue
           }
           className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
         >
-          {saving || (loadingAggregates && !isCorrection) ? (
+          {saving ||
+          loadingContractValue ||
+          (loadingAggregates && !isCorrection) ? (
             <Loader2 className="size-4 animate-spin" />
           ) : null}
 
-          {isCorrection ? "Save Correction" : "Complete Order"}
+          {isCorrection ? "Save Correction" : "Create Order"}
         </Button>
       </DialogFooter>
     </DialogContent>

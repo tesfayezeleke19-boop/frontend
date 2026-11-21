@@ -565,6 +565,38 @@ export default function SalesInvoicePage() {
   /* ---------------------------------------------------------------- */
   /* Confirmation screen after successful submission                   */
   /* ---------------------------------------------------------------- */
+  /**
+   * Start a genuinely fresh invoice.
+   *
+   * "New Invoice" navigates to the SAME route the success screen is already
+   * on, so React Router does not remount the page and the submitted-invoice
+   * state would stay on screen. Clearing the form state first guarantees a
+   * fresh form without touching or duplicating the saved invoice.
+   */
+  const startNewInvoice = () => {
+    setSubmittedInvoice(null);
+    setLoadedEditId(null);
+    setForm({ customerName: "", tin: "", fsNo: "", remark: "" });
+    setOrders([
+      {
+        aggregate: "",
+        quantity: "",
+        unitPrice: "",
+        royaltyInvoiceNumber: "",
+      },
+    ]);
+    setWithholdingEnabled(false);
+    setPayment({
+      bank: "",
+      paymentSender: "",
+      paymentReferenceNumber: "",
+    });
+    setPaymentEvidence(null);
+    setWithholdingEvidence(null);
+    setErrors({});
+    navigate("/sales/new-invoice", { replace: true });
+  };
+
   if (submittedInvoice) {
     const config = ORDER_STATUS_UI[submittedInvoice.status];
     return (
@@ -626,7 +658,7 @@ export default function SalesInvoicePage() {
           </Button>
           <Button
             variant="outline"
-            onClick={() => navigate("/sales/new-invoice")}
+            onClick={startNewInvoice}
             className="gap-2 border-input text-foreground hover:bg-accent"
           >
             <Plus className="size-4" />

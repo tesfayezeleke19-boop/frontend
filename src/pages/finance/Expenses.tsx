@@ -3,16 +3,12 @@
  * Finance Expenses — Workflow A (Finance-owned expenses) plus the Finance
  * review section for Workflow B (Admin-originated expenses).
  *
- * Workflow A: Finance records and manages its own expenses directly.
- * Workflow B: Admin-originated expenses submitted for Finance review.
- *
- * Payroll integration:
- * When navigating from Payroll Review with
- * { openExpenseForm: true }, automatically open a blank expense form.
+ * Category: expense_category — STANDARD / CASUAL
+ * Type: expense_type — actual expense type from the expense_types table
  */
 
 import { EthiopianDatePicker } from "@/components/ui/ethiopian-date-picker";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ComponentType } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { Button } from "@/components/ui/button";
@@ -55,13 +51,17 @@ import {
 } from "lucide-react";
 
 import {
-  useFinanceExpenses,
+  useExpenses,
   useFinanceReviewQueue,
 } from "@/hooks/use-finance-data";
 
 import { useAuth } from "@/hooks/use-auth";
 import { actorLabel } from "@/services/auth/profile";
-import { expensesRepository } from "@/services/finance/expenses";
+
+import {
+  expensesRepository,
+  isExpenseCounted,
+} from "@/services/finance/expenses";
 
 import ExpenseFormDialog from "@/components/finance/ExpenseFormDialog";
 
@@ -72,8 +72,6 @@ import {
 
 import {
   EXPENSE_TYPE,
-  EXPENSE_TYPE_LABELS,
-  expenseTypeOf,
   getExpenseDisplayStatus,
   type Expense,
   type ExpenseType,
@@ -90,8 +88,17 @@ import {
   EXPENSE_RANGE_OPTIONS,
   resolveExpenseDateRange,
   matchesExpenseSearch,
+  matchesExpenseDateRange,
   type ExpenseRangeKind,
 } from "@/services/finance/expenseFilters";
+
+const FinanceExpenseFormDialog = ExpenseFormDialog as ComponentType<{
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  mode: string;
+  initial: Expense | null;
+  onSaved?: (saved: Expense, submitted: boolean) => void;
+}>;
 
 const inputClass =
   "h-9 border-input bg-background text-sm text-foreground placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/30";
@@ -117,79 +124,249 @@ const dialogClass =
 const detailBoxClass =
   "rounded-lg border border-border bg-muted/50 p-3";
 
-export default function Expenses() {
-  // -----------------------------------------------------
-  // ROUTER
-  // -----------------------------------------------------
+type ExpenseAttachment = NonNullable<Expense["invoiceAttachment"]>;
 
-  const location = useLocation();
+/**
+ * API returns:
+ * category: STANDARD / CASUAL
+ * type: actual expense type, e.g. Maintenance
+ *
+ * Snake_case properties are also supported for compatibility.
+ */
+type ExpenseApiFields = {
+  category?: string | null;
+  type?: string | null;
+
+  expense_category?: string | null;
+  expenseCategory?: string | null;
+
+  expense_type?: string | null;
+  expenseType?: string | null;
+};
+
+/** Reads STANDARD / CASUAL from the category property. */
+function getExpenseCategory(expense: Expense): string {
+  const record = expense as Expense & ExpenseApiFields;
+
+  return String(
+    record.category ??
+      record.expense_category ??
+      record.expenseCategory ??
+      "",
+  )
+    .trim()
+    .toUpperCase();
+}
+
+/** Reads the actual expense type from the type property. */
+function getExpenseType(expense: Expense): string {
+  const record = expense as Expense & ExpenseApiFields;
+
+  return String(
+    record.type ??
+      record.expense_type ??
+      record.expenseType ??
+      "",
+  ).trim();
+}
+
+/** Returns the category classification only when it is valid. */
+function getExpenseCategoryClassification(
+  expense: Expense,
+): ExpenseType | null {
+  const category = getExpenseCategory(expense);
+
+  if (category === EXPENSE_TYPE.STANDARD) {
+    return EXPENSE_TYPE.STANDARD;
+  }
+
+  if (category === EXPENSE_TYPE.CASUAL) {
+    return EXPENSE_TYPE.CASUAL;
+  }
+
+  return null;
+}
+
+function normalizeExpenseCategory(expense: Expense): string {
+  return getExpenseCategory(expense);
+}
+
+/**
+ * Ethiopian calendar month filtering.
+ */
+function getEthiopianMonthKey(date: Date): string {
+  const formatter = new Intl.DateTimeFormat(
+    "en-US-u-ca-ethiopic-nu-latn",
+    {
+      year: "numeric",
+      month: "numeric",
+    },
+  );
+
+  const parts = formatter.formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+
+  return `${year}-${month}`;
+}
+
+function parseExpenseDate(dateValue: unknown): Date | null {
+  if (!dateValue) return null;
+
+  if (dateValue instanceof Date) {
+    return Number.isNaN(dateValue.getTime())
+      ? null
+      : new Date(
+          dateValue.getFullYear(),
+          dateValue.getMonth(),
+          dateValue.getDate(),
+        );
+  }
+
+  const value = String(dateValue).trim();
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+
+  if (match) {
+    const date = new Date(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3]),
+    );
+
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  const parsed = new Date(value);
+
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  return new Date(
+    parsed.getFullYear(),
+    parsed.getMonth(),
+    parsed.getDate(),
+  );
+}
+
+function getTargetEthiopianMonthKey(offset: 0 | -1): string {
+  const today = new Date();
+  const currentKey = getEthiopianMonthKey(today);
+
+  if (offset === 0) return currentKey;
+
+  const cursor = new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate(),
+  );
+
+  for (let day = 0; day < 36; day += 1) {
+    cursor.setDate(cursor.getDate() - 1);
+
+    if (getEthiopianMonthKey(cursor) !== currentKey) {
+      cursor.setDate(cursor.getDate() + 1);
+      break;
+    }
+  }
+
+  cursor.setDate(cursor.getDate() - 1);
+
+  return getEthiopianMonthKey(cursor);
+}
+
+function matchesEthiopianMonth(
+  expense: Expense,
+  offset: 0 | -1,
+): boolean {
+  const expenseDate = parseExpenseDate(expense.date);
+
+  if (!expenseDate) return false;
+
+  return (
+    getEthiopianMonthKey(expenseDate) ===
+    getTargetEthiopianMonthKey(offset)
+  );
+}
+
+/** Opens a stored expense attachment in the authenticated image viewer. */
+function ExpenseAttachmentLink({
+  attachment,
+  label,
+  colorClass = "text-blue-500",
+}: {
+  attachment: ExpenseAttachment;
+  label: string;
+  colorClass?: string;
+}) {
   const navigate = useNavigate();
 
-  // -----------------------------------------------------
-  // AUTHENTICATION AND DATA
-  // -----------------------------------------------------
+  const openAttachment = () => {
+    const src = `/api/finance/expenses/attachments/${attachment.id}`;
+
+    const params = new URLSearchParams({
+      src,
+      name: attachment.fileName,
+    });
+
+    navigate(`/evidence-image?${params.toString()}`);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={openAttachment}
+      title={`Open ${attachment.fileName}`}
+      className={`inline-flex max-w-[220px] items-center gap-1.5 truncate text-left text-xs hover:underline ${colorClass}`}
+    >
+      <Paperclip className="size-3 shrink-0" />
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
+export default function Expenses() {
+  const location = useLocation();
+  const navigate = useNavigate();
 
   const { user } = useAuth();
   const actor = actorLabel(user);
 
   const {
-    data: financeExpenses,
+    data: allExpenses,
     loading,
-  } = useFinanceExpenses();
+  } = useExpenses();
 
   const {
     data: reviewQueue,
   } = useFinanceReviewQueue();
 
-  // -----------------------------------------------------
-  // FORM STATE
-  // -----------------------------------------------------
-
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Expense | null>(null);
-
-  // -----------------------------------------------------
-  // PAYROLL REVIEW NAVIGATION INTEGRATION
-  // -----------------------------------------------------
 
   useEffect(() => {
     const navigationState = location.state as
       | { openExpenseForm?: boolean }
       | null;
 
-    if (!navigationState?.openExpenseForm) {
-      return;
-    }
+    if (!navigationState?.openExpenseForm) return;
 
-    // Always open a new blank expense form.
     setEditing(null);
     setFormOpen(true);
 
-    // Clear navigation state so refreshing the page or returning
-    // to Expenses does not reopen the form unexpectedly.
     navigate(location.pathname, {
       replace: true,
       state: null,
     });
   }, [location.pathname, location.state, navigate]);
 
-  // -----------------------------------------------------
-  // DIALOG STATE
-  // -----------------------------------------------------
-
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
-  // Admin expense review state.
   const [detailTarget, setDetailTarget] = useState<Expense | null>(null);
   const [approveTarget, setApproveTarget] = useState<Expense | null>(null);
   const [rejectTarget, setRejectTarget] = useState<Expense | null>(null);
 
   const [rejectReason, setRejectReason] = useState("");
   const [isReviewing, setIsReviewing] = useState(false);
-
-  // -----------------------------------------------------
-  // FINANCE EXPENSE FILTERS
-  // -----------------------------------------------------
 
   const [rangeKind, setRangeKind] =
     useState<ExpenseRangeKind>("ALL_TIME");
@@ -202,65 +379,66 @@ export default function Expenses() {
   const [typeFilter, setTypeFilter] =
     useState<"ALL" | ExpenseType>("ALL");
 
-  // -----------------------------------------------------
-  // DATE RANGE
-  // -----------------------------------------------------
-
   const rangeResult = useMemo(
     () => resolveExpenseDateRange(rangeKind, customFrom, customTo),
     [rangeKind, customFrom, customTo],
   );
 
-  // -----------------------------------------------------
-  // FILTER EXPENSE RECORDS
-  // -----------------------------------------------------
-
   const filtered = useMemo(() => {
-    const list = financeExpenses ?? [];
+    const list = (allExpenses ?? []).filter(isExpenseCounted);
 
-    return list.filter(
-      (expense) =>
-        (!rangeResult.range ||
-          (expense.date >= rangeResult.range!.start &&
-            expense.date <= rangeResult.range!.end)) &&
-        (typeFilter === "ALL" ||
-          expenseTypeOf(expense) === typeFilter) &&
-        matchesExpenseSearch(expense, search),
-    );
-  }, [financeExpenses, search, rangeResult, typeFilter]);
+    return list.filter((expense) => {
+      const categoryMatches =
+        typeFilter === "ALL" ||
+        normalizeExpenseCategory(expense) ===
+          String(typeFilter).trim().toUpperCase();
 
-  // -----------------------------------------------------
-  // FINANCIAL TOTALS
-  // -----------------------------------------------------
+      let dateMatches = true;
+
+      if (rangeKind === "THIS_MONTH") {
+        dateMatches = matchesEthiopianMonth(expense, 0);
+      } else if (rangeKind === "LAST_MONTH") {
+        dateMatches = matchesEthiopianMonth(expense, -1);
+      } else {
+        dateMatches = matchesExpenseDateRange(
+          expense,
+          rangeResult.range,
+        );
+      }
+
+      return (
+        dateMatches &&
+        categoryMatches &&
+        matchesExpenseSearch(expense, search)
+      );
+    });
+  }, [
+    allExpenses,
+    search,
+    rangeResult,
+    rangeKind,
+    typeFilter,
+  ]);
 
   const totalExpenses = filtered.reduce(
     (sum, expense) =>
-      sum +
-      (Number.isFinite(expense.amount) ? expense.amount : 0),
+      sum + (Number.isFinite(expense.amount) ? expense.amount : 0),
     0,
   );
 
   const totalVat = filtered.reduce(
     (sum, expense) =>
       sum +
-      (Number.isFinite(expense.vatAmount)
-        ? expense.vatAmount
-        : 0),
+      (Number.isFinite(expense.vatAmount) ? expense.vatAmount : 0),
     0,
   );
 
   const totalWht = filtered.reduce(
     (sum, expense) =>
       sum +
-      (Number.isFinite(expense.whtAmount)
-        ? expense.whtAmount
-        : 0),
+      (Number.isFinite(expense.whtAmount) ? expense.whtAmount : 0),
     0,
   );
-
-  // -----------------------------------------------------
-  // APPROVE ADMIN EXPENSE
-  // -----------------------------------------------------
 
   const confirmApprove = async () => {
     if (!approveTarget) return;
@@ -291,10 +469,6 @@ export default function Expenses() {
       setIsReviewing(false);
     }
   };
-
-  // -----------------------------------------------------
-  // REJECT ADMIN EXPENSE
-  // -----------------------------------------------------
 
   const confirmReject = async () => {
     if (!rejectTarget) return;
@@ -331,16 +505,11 @@ export default function Expenses() {
     }
   };
 
-  // -----------------------------------------------------
-  // DELETE FINANCE EXPENSE
-  // -----------------------------------------------------
-
   const handleDelete = async () => {
     if (!deleteId) return;
 
     try {
       await expensesRepository.deleteExpense(deleteId);
-
       toast.success("Expense deleted");
     } catch (error) {
       toast.error(
@@ -353,21 +522,13 @@ export default function Expenses() {
     }
   };
 
-  // -----------------------------------------------------
-  // LOADING STATE
-  // -----------------------------------------------------
-
-  if (loading && !financeExpenses) {
+  if (loading && !allExpenses) {
     return (
       <div className="flex items-center justify-center py-20">
         <Loader2 className="size-6 animate-spin text-muted-foreground" />
       </div>
     );
   }
-
-  // -----------------------------------------------------
-  // FILTER STATE
-  // -----------------------------------------------------
 
   const filtersActive =
     rangeKind !== "ALL_TIME" ||
@@ -378,17 +539,8 @@ export default function Expenses() {
 
   const pendingQueue = reviewQueue ?? [];
 
-  // -----------------------------------------------------
-  // PAGE
-  // -----------------------------------------------------
-
   return (
     <div className="space-y-6">
-
-      {/* ================================================= */}
-      {/* PAGE HEADER */}
-      {/* ================================================= */}
-
       <div className="flex items-start justify-between">
         <div>
           <h1 className="font-heading text-2xl font-semibold text-foreground">
@@ -408,12 +560,7 @@ export default function Expenses() {
         </Button>
       </div>
 
-      {/* ================================================= */}
-      {/* FINANCIAL SUMMARY */}
-      {/* ================================================= */}
-
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-
         <Card className="border-border bg-card shadow-none">
           <CardContent className="flex items-center gap-3 p-4">
             <div className="flex size-9 items-center justify-center rounded-lg border border-border bg-muted">
@@ -467,46 +614,46 @@ export default function Expenses() {
             </div>
           </CardContent>
         </Card>
-
       </div>
 
-      {/* ================================================= */}
-      {/* FINANCE EXPENSE RECORDS */}
-      {/* ================================================= */}
-
       <Card className="border-border bg-card shadow-none">
-
         <CardHeader className="pb-3">
           <CardTitle className="text-sm font-medium text-foreground">
             Expense Records
           </CardTitle>
         </CardHeader>
 
-        {/* FILTERS */}
-
         <CardContent className="sticky top-0 z-0 border-b border-border p-3">
           <div className="flex flex-wrap items-center gap-3">
-
             <Select
               value={rangeKind}
               onValueChange={(value) =>
                 setRangeKind(value as ExpenseRangeKind)
               }
             >
-              <SelectTrigger className={`${selectTriggerClass} w-40`}>
+              <SelectTrigger className={`${selectTriggerClass} w-44`}>
                 <SelectValue />
               </SelectTrigger>
 
               <SelectContent className={selectContentClass}>
-                {EXPENSE_RANGE_OPTIONS.map((option) => (
-                  <SelectItem
-                    key={option.value}
-                    value={option.value}
-                    className={selectItemClass}
-                  >
-                    {option.label}
-                  </SelectItem>
-                ))}
+                {EXPENSE_RANGE_OPTIONS.map((option) => {
+                  const label =
+                    option.value === "THIS_MONTH"
+                      ? "This Ethiopian Month"
+                      : option.value === "LAST_MONTH"
+                        ? "Last Ethiopian Month"
+                        : option.label;
+
+                  return (
+                    <SelectItem
+                      key={option.value}
+                      value={option.value}
+                      className={selectItemClass}
+                    >
+                      {label}
+                    </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
 
@@ -520,9 +667,7 @@ export default function Expenses() {
                   />
                 </div>
 
-                <span className="text-xs text-muted-foreground">
-                  to
-                </span>
+                <span className="text-xs text-muted-foreground">to</span>
 
                 <div className="w-40">
                   <EthiopianDatePicker
@@ -541,31 +686,27 @@ export default function Expenses() {
               }
             >
               <SelectTrigger className={`${selectTriggerClass} w-36`}>
-                <SelectValue />
+                <SelectValue placeholder="All categories" />
               </SelectTrigger>
 
               <SelectContent className={selectContentClass}>
-                <SelectItem
-                  value="ALL"
-                  className={selectItemClass}
-                >
-                  All types
+                <SelectItem value="ALL" className={selectItemClass}>
+                  All categories
                 </SelectItem>
 
-                {(
-                  [
-                    EXPENSE_TYPE.STANDARD,
-                    EXPENSE_TYPE.CASUAL,
-                  ] as const
-                ).map((type) => (
-                  <SelectItem
-                    key={type}
-                    value={type}
-                    className={selectItemClass}
-                  >
-                    {EXPENSE_TYPE_LABELS[type]}
-                  </SelectItem>
-                ))}
+                <SelectItem
+                  value={EXPENSE_TYPE.STANDARD}
+                  className={selectItemClass}
+                >
+                  Standard
+                </SelectItem>
+
+                <SelectItem
+                  value={EXPENSE_TYPE.CASUAL}
+                  className={selectItemClass}
+                >
+                  Casual
+                </SelectItem>
               </SelectContent>
             </Select>
 
@@ -597,24 +738,20 @@ export default function Expenses() {
                 Clear
               </Button>
             )}
-
           </div>
 
-          {rangeResult.error && (
+          {rangeResult.error && rangeKind === "CUSTOM" && (
             <p className="mt-2 text-xs text-destructive">
               {rangeResult.error}
             </p>
           )}
         </CardContent>
 
-        {/* EXPENSE TABLE */}
-
         <CardContent className="p-0">
           {filtered.length > 0 ? (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-
-                <thead>
+            <div className="max-h-[520px] overflow-auto">
+              <table className="w-full min-w-[1200px] text-sm">
+                <thead className="sticky top-0 z-10 bg-muted">
                   <tr className={tableHeaderClass}>
                     <th className="px-4 py-2.5 font-medium">Date</th>
                     <th className="px-4 py-2.5 font-medium">Category</th>
@@ -635,36 +772,35 @@ export default function Expenses() {
                 <tbody>
                   {filtered.map((expense) => {
                     const display = getExpenseDisplayStatus(expense);
+                    const category = getExpenseCategoryClassification(expense);
 
                     return (
-                      <tr
-                        key={expense.id}
-                        className={tableRowClass}
-                      >
-
+                      <tr key={expense.id} className={tableRowClass}>
                         <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
                           {formatDate(expense.date)}
-                        </td>
-
-                        <td className="px-4 py-2.5 text-muted-foreground">
-                          {expense.category || "—"}
-                        </td>
-
-                        <td className="px-4 py-2.5 text-foreground">
-                          {expense.item}
                         </td>
 
                         <td className="px-4 py-2.5">
                           <Badge
                             variant="outline"
                             className={`border text-[10px] font-medium ${
-                              expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
+                              category === EXPENSE_TYPE.CASUAL
                                 ? "erp-badge-draft"
-                                : "erp-badge-approved"
+                                : category === EXPENSE_TYPE.STANDARD
+                                  ? "erp-badge-approved"
+                                  : ""
                             }`}
                           >
-                            {EXPENSE_TYPE_LABELS[expenseTypeOf(expense)]}
+                            {getExpenseCategory(expense) || "—"}
                           </Badge>
+                        </td>
+
+                        <td className="px-4 py-2.5 text-foreground">
+                          {expense.item}
+                        </td>
+
+                        <td className="px-4 py-2.5 text-muted-foreground">
+                          {getExpenseType(expense) || "—"}
                         </td>
 
                         <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
@@ -672,7 +808,7 @@ export default function Expenses() {
                         </td>
 
                         <td className="px-4 py-2.5 text-right tabular-nums text-amber-500">
-                          {expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
+                          {category === EXPENSE_TYPE.CASUAL
                             ? "N/A"
                             : formatCurrency(expense.vatAmount ?? 0)}
                         </td>
@@ -704,28 +840,27 @@ export default function Expenses() {
                         </td>
 
                         <td className="px-4 py-2.5">
-                          <div className="flex gap-1">
-
+                          <div className="flex min-w-[150px] flex-col items-start gap-1">
                             {expense.invoiceAttachment && (
-                              <span
-                                title={`Invoice: ${expense.invoiceAttachment.fileName}`}
-                              >
-                                <Paperclip className="size-3 text-blue-500" />
-                              </span>
+                              <ExpenseAttachmentLink
+                                attachment={expense.invoiceAttachment}
+                                label="Evidence"
+                                colorClass="text-blue-500"
+                              />
                             )}
 
                             {expense.whtAttachment && (
-                              <span
-                                title={`WHT: ${expense.whtAttachment.fileName}`}
-                              >
-                                <Paperclip className="size-3 text-violet-500" />
-                              </span>
+                              <ExpenseAttachmentLink
+                                attachment={expense.whtAttachment}
+                                label="Withholding"
+                                colorClass="text-violet-500"
+                              />
                             )}
 
                             {!expense.invoiceAttachment &&
-                              !expense.whtAttachment &&
-                              "—"}
-
+                              !expense.whtAttachment && (
+                                <span className="text-muted-foreground">—</span>
+                              )}
                           </div>
                         </td>
 
@@ -740,7 +875,6 @@ export default function Expenses() {
 
                         <td className="px-4 py-2.5 text-right">
                           <div className="flex items-center justify-end gap-1">
-
                             <Button
                               variant="ghost"
                               size="sm"
@@ -763,20 +897,16 @@ export default function Expenses() {
                               <Trash2 className="size-3" />
                               Delete
                             </Button>
-
                           </div>
                         </td>
-
                       </tr>
                     );
                   })}
                 </tbody>
-
               </table>
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center py-16 text-center">
-
               <Receipt className="mb-3 size-8 text-muted-foreground" />
 
               <p className="text-sm font-medium text-foreground">
@@ -800,18 +930,12 @@ export default function Expenses() {
                 <Plus className="size-3.5" />
                 Add Expense
               </Button>
-
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* ================================================= */}
-      {/* ADMIN EXPENSE REVIEW */}
-      {/* ================================================= */}
-
       <Card className="border-border bg-card shadow-none">
-
         <CardHeader className="pb-3">
           <div className="flex items-center gap-2">
             <ClipboardCheck className="size-4 text-success" />
@@ -819,6 +943,10 @@ export default function Expenses() {
             <CardTitle className="text-sm font-medium text-foreground">
               Admin Expense Review
             </CardTitle>
+
+            <Badge variant="secondary" className="ml-auto">
+              {pendingQueue.length} Pending
+            </Badge>
           </div>
         </CardHeader>
 
@@ -832,7 +960,6 @@ export default function Expenses() {
             />
           ) : (
             <div className="flex flex-col items-center justify-center py-12 text-center">
-
               <ShieldCheck className="mb-3 size-8 text-muted-foreground" />
 
               <p className="text-sm font-medium text-foreground">
@@ -842,17 +969,12 @@ export default function Expenses() {
               <p className="mt-1 text-xs text-muted-foreground">
                 Expenses Admin submits for review appear here.
               </p>
-
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* ================================================= */}
-      {/* CREATE / EDIT EXPENSE DIALOG */}
-      {/* ================================================= */}
-
-      <ExpenseFormDialog
+      <FinanceExpenseFormDialog
         open={formOpen}
         onOpenChange={(open) => {
           setFormOpen(open);
@@ -863,11 +985,10 @@ export default function Expenses() {
         }}
         mode="finance"
         initial={editing}
+        onSaved={() => {
+          // The repository notification reloads the expense hooks.
+        }}
       />
-
-      {/* ================================================= */}
-      {/* ADMIN EXPENSE DETAIL DIALOG */}
-      {/* ================================================= */}
 
       <ExpenseReviewDetail
         expense={detailTarget}
@@ -886,10 +1007,6 @@ export default function Expenses() {
         }}
       />
 
-      {/* ================================================= */}
-      {/* APPROVE CONFIRMATION */}
-      {/* ================================================= */}
-
       <Dialog
         open={!!approveTarget}
         onOpenChange={(open) => {
@@ -899,7 +1016,6 @@ export default function Expenses() {
         }}
       >
         <DialogContent className={`${dialogClass} sm:max-w-md`}>
-
           <DialogHeader>
             <DialogTitle className="text-lg font-semibold text-foreground">
               Approve Expense
@@ -922,9 +1038,7 @@ export default function Expenses() {
 
           {approveTarget && (
             <div className="rounded-lg border border-border bg-muted/50 p-3 text-xs text-muted-foreground">
-
               <div className="grid grid-cols-3 gap-2">
-
                 <div>
                   <span className="block">Before VAT</span>
                   <span className="font-medium text-foreground">
@@ -935,7 +1049,7 @@ export default function Expenses() {
                 <div>
                   <span className="block">VAT</span>
                   <span className="font-medium text-foreground">
-                    {expenseTypeOf(approveTarget) === EXPENSE_TYPE.CASUAL
+                    {getExpenseCategoryClassification(approveTarget) === EXPENSE_TYPE.CASUAL
                       ? "N/A"
                       : formatCurrency(approveTarget.vatAmount ?? 0)}
                   </span>
@@ -949,13 +1063,11 @@ export default function Expenses() {
                       : "—"}
                   </span>
                 </div>
-
               </div>
             </div>
           )}
 
           <DialogFooter>
-
             <Button
               variant="ghost"
               onClick={() => setApproveTarget(null)}
@@ -975,17 +1087,11 @@ export default function Expenses() {
               ) : (
                 <CheckCircle2 className="size-4" />
               )}
-
               Approve Expense
             </Button>
-
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      {/* ================================================= */}
-      {/* REJECT CONFIRMATION */}
-      {/* ================================================= */}
 
       <Dialog
         open={!!rejectTarget}
@@ -997,7 +1103,6 @@ export default function Expenses() {
         }}
       >
         <DialogContent className={`${dialogClass} sm:max-w-md`}>
-
           <DialogHeader>
             <DialogTitle className="text-lg font-semibold text-foreground">
               Reject Expense
@@ -1011,7 +1116,6 @@ export default function Expenses() {
           </DialogHeader>
 
           <div className="space-y-3">
-
             <div className="rounded-lg border border-border bg-muted/50 p-3 text-xs text-muted-foreground">
               <span className="font-medium text-foreground">
                 {rejectTarget?.item}
@@ -1028,11 +1132,9 @@ export default function Expenses() {
                 className="resize-none border-input bg-background text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-ring/30"
               />
             </div>
-
           </div>
 
           <DialogFooter>
-
             <Button
               variant="ghost"
               onClick={() => {
@@ -1056,28 +1158,19 @@ export default function Expenses() {
               ) : (
                 <XCircle className="size-4" />
               )}
-
               Reject Expense
             </Button>
-
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* ================================================= */}
-      {/* DELETE CONFIRMATION */}
-      {/* ================================================= */}
-
       <Dialog
         open={!!deleteId}
         onOpenChange={(open) => {
-          if (!open) {
-            setDeleteId(null);
-          }
+          if (!open) setDeleteId(null);
         }}
       >
         <DialogContent className={`${dialogClass} sm:max-w-sm`}>
-
           <DialogHeader>
             <DialogTitle className="text-lg font-semibold text-foreground">
               Delete Expense
@@ -1090,7 +1183,6 @@ export default function Expenses() {
           </DialogHeader>
 
           <DialogFooter>
-
             <Button
               variant="ghost"
               onClick={() => setDeleteId(null)}
@@ -1107,18 +1199,14 @@ export default function Expenses() {
               <Trash2 className="size-4" />
               Delete
             </Button>
-
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
     </div>
   );
 }
 
-/* ===================================================== */
-/* ADMIN EXPENSE REVIEW QUEUE                            */
-/* ===================================================== */
+/* ADMIN EXPENSE REVIEW QUEUE */
 
 function ReviewQueue({
   queue,
@@ -1132,14 +1220,14 @@ function ReviewQueue({
   onView: (expense: Expense) => void;
 }) {
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-
-        <thead>
+    <div className="max-h-[420px] overflow-auto">
+      <table className="w-full min-w-[1150px] text-sm">
+        <thead className="sticky top-0 z-10 bg-muted">
           <tr className={tableHeaderClass}>
             <th className="px-4 py-2.5 font-medium">Date</th>
             <th className="px-4 py-2.5 font-medium">Category</th>
             <th className="px-4 py-2.5 font-medium">Item</th>
+            <th className="px-4 py-2.5 font-medium">Type</th>
             <th className="px-4 py-2.5 text-right font-medium">Before VAT</th>
             <th className="px-4 py-2.5 text-right font-medium">VAT</th>
             <th className="px-4 py-2.5 text-right font-medium">Total / After VAT</th>
@@ -1154,146 +1242,146 @@ function ReviewQueue({
         </thead>
 
         <tbody>
-          {queue.map((expense) => (
-            <tr
-              key={expense.id}
-              className={tableRowClass}
-            >
+          {queue.map((expense) => {
+            const category = getExpenseCategoryClassification(expense);
 
-              <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                {formatDate(expense.date)}
-              </td>
+            return (
+              <tr key={expense.id} className={tableRowClass}>
+                <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
+                  {formatDate(expense.date)}
+                </td>
 
-              <td className="px-4 py-2.5 text-muted-foreground">
-                {expense.category || "—"}
-              </td>
+                <td className="px-4 py-2.5">
+                  <Badge
+                    variant="outline"
+                    className={`border text-[10px] font-medium ${
+                      category === EXPENSE_TYPE.CASUAL
+                        ? "erp-badge-draft"
+                        : category === EXPENSE_TYPE.STANDARD
+                          ? "erp-badge-approved"
+                          : ""
+                    }`}
+                  >
+                    {getExpenseCategory(expense) || "—"}
+                  </Badge>
+                </td>
 
-              <td className="px-4 py-2.5 text-foreground">
-                {expense.item}
+                <td className="px-4 py-2.5 text-foreground">
+                  {expense.item}
+                </td>
 
-                <div className="text-[10px] text-muted-foreground">
-                  {EXPENSE_TYPE_LABELS[expenseTypeOf(expense)]}
-                </div>
-              </td>
+                <td className="px-4 py-2.5 text-muted-foreground">
+                  {getExpenseType(expense) || "—"}
+                </td>
 
-              <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
-                {formatCurrency(expense.amountBeforeVat ?? 0)}
-              </td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-muted-foreground">
+                  {formatCurrency(expense.amountBeforeVat ?? 0)}
+                </td>
 
-              <td className="px-4 py-2.5 text-right tabular-nums text-amber-500">
-                {expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
-                  ? "N/A"
-                  : formatCurrency(expense.vatAmount ?? 0)}
-              </td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-amber-500">
+                  {category === EXPENSE_TYPE.CASUAL
+                    ? "N/A"
+                    : formatCurrency(expense.vatAmount ?? 0)}
+                </td>
 
-              <td className="px-4 py-2.5 text-right font-medium tabular-nums text-red-500">
-                {formatCurrency(expense.amount)}
-              </td>
+                <td className="px-4 py-2.5 text-right font-medium tabular-nums text-red-500">
+                  {formatCurrency(expense.amount)}
+                </td>
 
-              <td className="px-4 py-2.5 text-right tabular-nums text-violet-500">
-                {expense.whtAmount
-                  ? formatCurrency(expense.whtAmount)
-                  : "—"}
-              </td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-violet-500">
+                  {expense.whtAmount
+                    ? formatCurrency(expense.whtAmount)
+                    : "—"}
+                </td>
 
-              <td className="px-4 py-2.5 text-right font-medium tabular-nums text-foreground">
-                {formatCurrency(
-                  expense.totalTransferred ?? expense.amount,
-                )}
-              </td>
-
-              <td className="px-4 py-2.5 text-muted-foreground">
-                {expense.bank || "—"}
-              </td>
-
-              <td className="px-4 py-2.5">
-                <div className="flex gap-1">
-
-                  {expense.invoiceAttachment && (
-                    <span
-                      title={`Invoice: ${expense.invoiceAttachment.fileName}`}
-                    >
-                      <Paperclip className="size-3 text-blue-500" />
-                    </span>
+                <td className="px-4 py-2.5 text-right font-medium tabular-nums text-foreground">
+                  {formatCurrency(
+                    expense.totalTransferred ?? expense.amount,
                   )}
+                </td>
 
-                  {expense.whtAttachment && (
-                    <span
-                      title={`WHT: ${expense.whtAttachment.fileName}`}
+                <td className="px-4 py-2.5 text-muted-foreground">
+                  {expense.bank || "—"}
+                </td>
+
+                <td className="px-4 py-2.5">
+                  <div className="flex min-w-[150px] flex-col items-start gap-1">
+                    {expense.invoiceAttachment && (
+                      <ExpenseAttachmentLink
+                        attachment={expense.invoiceAttachment}
+                        label="Evidence"
+                        colorClass="text-blue-500"
+                      />
+                    )}
+
+                    {expense.whtAttachment && (
+                      <ExpenseAttachmentLink
+                        attachment={expense.whtAttachment}
+                        label="Withholding"
+                        colorClass="text-violet-500"
+                      />
+                    )}
+
+                    {!expense.invoiceAttachment &&
+                      !expense.whtAttachment && (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                  </div>
+                </td>
+
+                <td className="px-4 py-2.5 text-xs text-muted-foreground">
+                  {expense.submittedBy || "—"}
+                </td>
+
+                <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
+                  {expense.submittedAt
+                    ? formatDate(expense.submittedAt)
+                    : "—"}
+                </td>
+
+                <td className="px-4 py-2.5 text-right">
+                  <div className="flex items-center justify-end gap-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
+                      onClick={() => onView(expense)}
                     >
-                      <Paperclip className="size-3 text-violet-500" />
-                    </span>
-                  )}
+                      View Details
+                    </Button>
 
-                  {!expense.invoiceAttachment &&
-                    !expense.whtAttachment &&
-                    "—"}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 gap-1 text-xs text-success hover:text-success"
+                      onClick={() => onApprove(expense)}
+                    >
+                      <CheckCircle2 className="size-3" />
+                      Approve
+                    </Button>
 
-                </div>
-              </td>
-
-              <td className="px-4 py-2.5 text-xs text-muted-foreground">
-                {expense.submittedBy || "—"}
-              </td>
-
-              <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                {expense.submittedAt
-                  ? formatDate(expense.submittedAt)
-                  : "—"}
-              </td>
-
-              <td className="px-4 py-2.5 text-right">
-                <div className="flex items-center justify-end gap-1">
-
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
-                    onClick={() => onView(expense)}
-                  >
-                    View Details
-                  </Button>
-
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 gap-1 text-xs text-success hover:text-success"
-                    onClick={() => onApprove(expense)}
-                  >
-                    <CheckCircle2 className="size-3" />
-                    Approve
-                  </Button>
-
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 gap-1 text-xs text-muted-foreground hover:text-destructive"
-                    onClick={() => onReject(expense)}
-                  >
-                    <XCircle className="size-3" />
-                    Reject
-                  </Button>
-
-                </div>
-              </td>
-
-            </tr>
-          ))}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 gap-1 text-xs text-muted-foreground hover:text-destructive"
+                      onClick={() => onReject(expense)}
+                    >
+                      <XCircle className="size-3" />
+                      Reject
+                    </Button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
-
       </table>
     </div>
   );
 }
 
-/* ===================================================== */
-/* ADMIN EXPENSE DETAIL DIALOG                           */
-/* ===================================================== */
+/* ADMIN EXPENSE DETAIL DIALOG */
 
-/**
- * Full breakdown + attachments of a pending Admin expense.
- * Opening this dialog changes nothing.
- */
 function ExpenseReviewDetail({
   expense,
   onClose,
@@ -1305,13 +1393,16 @@ function ExpenseReviewDetail({
   onApprove: () => void;
   onReject: () => void;
 }) {
+  const category = expense
+    ? getExpenseCategoryClassification(expense)
+    : null;
+
   return (
     <Dialog
       open={!!expense}
       onOpenChange={(open) => !open && onClose()}
     >
       <DialogContent className={`max-h-[85vh] overflow-y-auto ${dialogClass} sm:max-w-2xl`}>
-
         {expense && (
           <>
             <DialogHeader>
@@ -1326,11 +1417,7 @@ function ExpenseReviewDetail({
             </DialogHeader>
 
             <div className="space-y-4 text-sm">
-
-              {/* BASIC INFORMATION */}
-
               <div className="grid gap-3 sm:grid-cols-3">
-
                 <div className={detailBoxClass}>
                   <div className="text-xs text-muted-foreground">
                     Expense Date
@@ -1347,7 +1434,7 @@ function ExpenseReviewDetail({
                   </div>
 
                   <div className="mt-1 font-medium text-foreground">
-                    {expense.category || "—"}
+                    {getExpenseCategory(expense) || "—"}
                   </div>
                 </div>
 
@@ -1357,22 +1444,17 @@ function ExpenseReviewDetail({
                   </div>
 
                   <div className="mt-1 font-medium text-foreground">
-                    {EXPENSE_TYPE_LABELS[expenseTypeOf(expense)]}
+                    {getExpenseType(expense) || "—"}
                   </div>
                 </div>
-
               </div>
 
-              {/* AMOUNT BREAKDOWN */}
-
               <div className={detailBoxClass}>
-
                 <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
                   Expense amount breakdown
                 </div>
 
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-
                   <div>
                     <div className="text-xs text-muted-foreground">
                       Before VAT
@@ -1385,13 +1467,13 @@ function ExpenseReviewDetail({
 
                   <div>
                     <div className="text-xs text-muted-foreground">
-                      {expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
+                      {category === EXPENSE_TYPE.CASUAL
                         ? "VAT"
                         : `VAT (${Math.round(EXPENSE_VAT_RATE * 100)}%)`}
                     </div>
 
                     <div className="mt-1 tabular-nums text-amber-500">
-                      {expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
+                      {category === EXPENSE_TYPE.CASUAL
                         ? "Not applicable"
                         : formatCurrency(expense.vatAmount ?? 0)}
                     </div>
@@ -1430,23 +1512,18 @@ function ExpenseReviewDetail({
                       )}
                     </div>
                   </div>
-
                 </div>
               </div>
 
-              {/* PAYMENT INFORMATION AND TIMELINE */}
-
               <div className="grid gap-3 sm:grid-cols-2">
-
                 <div className={detailBoxClass}>
-
                   <div className="text-xs text-muted-foreground">
                     Bank / Payment info
                   </div>
 
                   <div className="mt-1 font-medium text-foreground">
                     {expense.bank ||
-                      (expenseTypeOf(expense) === EXPENSE_TYPE.CASUAL
+                      (category === EXPENSE_TYPE.CASUAL
                         ? "Not provided (optional)"
                         : "Not provided")}
                   </div>
@@ -1462,17 +1539,14 @@ function ExpenseReviewDetail({
                       Ref: {expense.paymentReference}
                     </div>
                   )}
-
                 </div>
 
                 <div className={detailBoxClass}>
-
                   <div className="text-xs text-muted-foreground">
                     Timeline
                   </div>
 
                   <div className="mt-1 space-y-1 text-xs text-muted-foreground">
-
                     <div>
                       Created{" "}
                       {formatDate(expense.createdAt, { time: true })}
@@ -1488,17 +1562,12 @@ function ExpenseReviewDetail({
                           : ""}
                       </div>
                     )}
-
                   </div>
                 </div>
-
               </div>
-
-              {/* REMARK */}
 
               {expense.remark && (
                 <div className={detailBoxClass}>
-
                   <div className="text-xs text-muted-foreground">
                     Remark
                   </div>
@@ -1506,70 +1575,42 @@ function ExpenseReviewDetail({
                   <div className="mt-1 text-foreground">
                     {expense.remark}
                   </div>
-
                 </div>
               )}
 
-              {/* ATTACHMENTS */}
-
               <div className={detailBoxClass}>
-
                 <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
                   Attachments
                 </div>
 
-                {[
-                  expense.invoiceAttachment,
-                  expense.whtAttachment,
-                ].filter(Boolean).length > 0 ? (
-                  <ul className="space-y-1.5">
+                {expense.invoiceAttachment || expense.whtAttachment ? (
+                  <div className="flex flex-col items-start gap-1.5">
+                    {expense.invoiceAttachment && (
+                      <ExpenseAttachmentLink
+                        attachment={expense.invoiceAttachment}
+                        label="Evidence"
+                        colorClass="text-blue-500"
+                      />
+                    )}
 
-                    {[
-                      expense.invoiceAttachment,
-                      expense.whtAttachment,
-                    ]
-                      .filter(Boolean)
-                      .map((attachment) =>
-                        attachment ? (
-                          <li key={attachment.id}>
-                            <span
-                              title={`${attachment.fileName}${
-                                attachment.mimeType
-                                  ? ` · ${attachment.mimeType}`
-                                  : ""
-                              }`}
-                              className="inline-flex items-center gap-1.5 text-xs text-blue-500"
-                            >
-                              <Paperclip className="size-3" />
-                              {attachment.fileName}
-                            </span>
-                          </li>
-                        ) : null,
-                      )}
-
-                  </ul>
+                    {expense.whtAttachment && (
+                      <ExpenseAttachmentLink
+                        attachment={expense.whtAttachment}
+                        label="Withholding"
+                        colorClass="text-violet-500"
+                      />
+                    )}
+                  </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
                     No attachments
                   </p>
                 )}
-
-                <p className="mt-2 text-[10px] text-muted-foreground">
-                  Note: attachments are stored as browser-session metadata
-                  until proper backend file storage exists — downloads can
-                  only resolve when the same session is available.
-                </p>
-
               </div>
-
             </div>
 
             <DialogFooter>
-
-              <Button
-                onClick={onApprove}
-                className="gap-2"
-              >
+              <Button onClick={onApprove} className="gap-2">
                 <CheckCircle2 className="size-4" />
                 Approve
               </Button>
@@ -1590,11 +1631,9 @@ function ExpenseReviewDetail({
               >
                 Close
               </Button>
-
             </DialogFooter>
           </>
         )}
-
       </DialogContent>
     </Dialog>
   );

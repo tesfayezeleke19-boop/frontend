@@ -137,6 +137,39 @@ export const financeRoyaltyReportsApi = {
     return Array.isArray(result.data) ? result.data : [];
   },
 
+  /**
+   * Load ONE completed batch with its exact historical records.
+   *
+   * The page must not reconstruct a batch from the LIVE report rows (which
+   * change and exclude finalized records), so the backend has to return the
+   * persisted snapshot for the requested batch id.
+   */
+  async getBatch(batchId: string): Promise<{
+    batch: FinanceRoyaltyBatch | null;
+    rows: FinanceRoyaltyReportRow[];
+  }> {
+    const result = await request<ApiResponse<unknown>>(
+      `${ROOT}/batches/${encodeURIComponent(batchId)}`,
+    );
+
+    const data = result.data as
+      | FinanceRoyaltyReportRow[]
+      | {
+          batch?: FinanceRoyaltyBatch;
+          rows?: FinanceRoyaltyReportRow[];
+          records?: FinanceRoyaltyReportRow[];
+          items?: FinanceRoyaltyReportRow[];
+        }
+      | null;
+
+    if (Array.isArray(data)) {
+      return { batch: null, rows: data };
+    }
+
+    const rows = data?.rows ?? data?.records ?? data?.items ?? [];
+    return { batch: data?.batch ?? null, rows: Array.isArray(rows) ? rows : [] };
+  },
+
   async finalizeBatch(orderIds: string[]): Promise<FinanceRoyaltyBatch> {
     const result = await request<ApiResponse<FinanceRoyaltyBatch>>(`${ROOT}/batches`, {
       method: "POST",

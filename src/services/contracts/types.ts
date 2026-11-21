@@ -1,41 +1,26 @@
+
 /**
  * NexERP — Contract Orders data model.
  *
- * A Contract is a LARGE customer agreement (e.g. 10,000,000 ETB) that is
- * fulfilled through MANY individual orders over time. Contracts belong to
- * the company, not to an individual salesperson: any authorized Sales user
- * can complete an order under any active contract, and each completed order
- * is attributed to the authenticated user who completed it.
- *
- * Lifecycle (independent of the ordinary Sales Invoice lifecycle):
- *
- *   DRAFT → IN_PROGRESS → READY_FOR_COMPLETION → CONVERTED
- *                    └──────────→ CANCELLED
- *
- * A completed contract order is reported in the existing shared Royalty
- * Report immediately — long before the contract is converted into one
- * Sales Invoice. Royalty reporting does NOT complete, convert, or finalize
- * the contract, and the contract lifecycle never changes because of the
- * Royalty Report.
- *
- * Fulfillment basis (see getContractProgress): a contract value is the
- * amount the customer contracted to pay, and the existing Sales Invoice
- * model stores unit prices VAT-EXCLUSIVE with the payable invoice total =
- * subtotal × 1.15. Contract fulfillment therefore uses the VAT-INCLUSIVE
- * order total (quantity × unit price × 1.15) so "fulfilled" and "contract
- * value" are compared on the same payable basis. Royalty reporting keeps
- * its own, unchanged VAT-EXCLUSIVE base (quantity × unit price) — these are
- * two different business calculations and are never mixed.
+ * Contract values and order fulfillment use the VAT-inclusive payable basis.
+ * Pending orders reserve contract value but do not count as approved
+ * fulfillment or royalty-report entries.
  *
  * Aggregate codes are preserved as STRINGS ("00" is never 0).
  */
-import { normalizeNumber, roundMoney, VAT_DIVISOR } from "../sales/calc";
+import {
+  normalizeNumber,
+  roundMoney,
+  VAT_DIVISOR,
+} from "../sales/calc";
 import { AGGREGATE_TYPES, type AggregateType } from "../sales/types";
 import type { FileEvidence } from "../sales/invoice";
 import type {
   ContractPaymentHistoryEntry,
   ContractPaymentInformation,
+  ContractPaymentInput,
   ContractWithholdingInformation,
+  ContractWithholdingInput,
 } from "./financials";
 
 /* ------------------------------------------------------------------ */
@@ -44,56 +29,47 @@ import type {
 
 export const CONTRACT_STATUS = {
   DRAFT: "DRAFT",
-  IN_PROGRESS: "IN_PROGRESS",
-  READY_FOR_COMPLETION: "READY_FOR_COMPLETION",
-  CONVERTED: "CONVERTED",
-  CANCELLED: "CANCELLED",
+  ACTIVE: "ACTIVE",
+  COMPLETED: "COMPLETED",
 } as const;
 
-export type ContractStatus = (typeof CONTRACT_STATUS)[keyof typeof CONTRACT_STATUS];
+export type ContractStatus =
+  (typeof CONTRACT_STATUS)[keyof typeof CONTRACT_STATUS];
 
 export const CONTRACT_STATUS_LABELS: Record<ContractStatus, string> = {
   DRAFT: "Draft",
-  IN_PROGRESS: "In Progress",
-  READY_FOR_COMPLETION: "Ready for Completion",
-  CONVERTED: "Converted",
-  CANCELLED: "Cancelled",
+  ACTIVE: "Active",
+  COMPLETED: "Completed",
 };
 
-/** Status → badge styling (same convention as the Sales order badges). */
 export const CONTRACT_STATUS_UI: Record<
   ContractStatus,
   { label: string; className: string }
 > = {
-  DRAFT: { label: "Draft", className: "erp-badge-draft" },
-  IN_PROGRESS: { label: "In Progress", className: "erp-badge-pending" },
-  READY_FOR_COMPLETION: {
-    label: "Ready for Completion",
+  DRAFT: {
+    label: "Draft",
+    className: "erp-badge-draft",
+  },
+  ACTIVE: {
+    label: "Active",
     className: "erp-badge-pending",
   },
-  CONVERTED: { label: "Converted", className: "erp-badge-approved" },
-  CANCELLED: { label: "Cancelled", className: "erp-badge-rejected" },
+  COMPLETED: {
+    label: "Completed",
+    className: "erp-badge-approved",
+  },
 };
 
-/** Contracts that still accept new orders from any authorized Sales user. */
 export function canAcceptOrders(status: ContractStatus): boolean {
-  return (
-    status === CONTRACT_STATUS.IN_PROGRESS ||
-    status === CONTRACT_STATUS.READY_FOR_COMPLETION
-  );
+  return status === CONTRACT_STATUS.ACTIVE;
 }
 
 /* ------------------------------------------------------------------ */
-/* Contract order lifecycle                                           */
+/* Contract order lifecycle                                            */
 /* ------------------------------------------------------------------ */
 
-/**
- * A contract order has no separate draft workflow: the order form IS the
- * completion action, so a successfully saved order is COMPLETED and is
- * reported for royalty immediately. CANCELLED keeps the record (and its
- * audit trail) but removes it from the active royalty totals.
- */
 export const CONTRACT_ORDER_STATUS = {
+  PENDING: "PENDING",
   COMPLETED: "COMPLETED",
   CANCELLED: "CANCELLED",
 } as const;
@@ -101,29 +77,27 @@ export const CONTRACT_ORDER_STATUS = {
 export type ContractOrderStatus =
   (typeof CONTRACT_ORDER_STATUS)[keyof typeof CONTRACT_ORDER_STATUS];
 
-/**
- * Attachments reuse the existing API-ready file-evidence model
- * ({ id, fileName, fileUrl, mimeType, fileSize }) — no second attachment
- * model is introduced for contracts.
- */
 export type ContractAttachment = FileEvidence;
 
-/** Paper-contract document types accepted by the existing upload pattern. */
+export const MAX_CONTRACT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
 export const CONTRACT_ATTACHMENT_MIME_TYPES = [
   "application/pdf",
   "image/jpeg",
   "image/jpg",
   "image/png",
+  "image/webp",
 ] as const;
 
-/** `accept` attribute for the paper-contract upload input. */
 export const CONTRACT_ATTACHMENT_ACCEPT =
-  "application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png";
+  "application/pdf,image/jpeg,image/png,image/webp,.pdf,.jpg,.jpeg,.png,.webp";
 
 export function isAcceptedContractAttachmentType(mimeType: string): boolean {
   const normalized = (mimeType || "").trim().toLowerCase();
+
   if (!normalized) return false;
   if (normalized === "image/jpg") return true;
+
   return (CONTRACT_ATTACHMENT_MIME_TYPES as readonly string[]).includes(
     normalized,
   );
@@ -132,111 +106,90 @@ export function isAcceptedContractAttachmentType(mimeType: string): boolean {
 export interface ContractStatusHistoryEntry {
   status: ContractStatus;
   at: number;
-  /** Actor identity (session email/name) that caused the transition. */
   by?: string;
   note?: string;
 }
 
-/** A large customer contract fulfilled by many individual orders. */
 export interface Contract {
   id: string;
-  /** Generated internal contract id — e.g. CONTRACT-0001. Never user-typed. */
   contractNumber: string;
-  customer: { name: string; tin: string };
-  /**
-   * Contract value in ETB, VAT-INCLUSIVE (same payable basis as
-   * fulfillment — see getContractProgress).
-   */
+  customer: {
+    name: string;
+    tin: string;
+  };
+
+  /** VAT-inclusive contract value. */
   contractValue: number;
-  /** ONE FS No per contract, carried into the resulting Sales Invoice. */
+
   fsNo: string;
   contractDate: number;
-  /** Signed/original paper contract images or PDFs (contract-level). */
   attachments: ContractAttachment[];
   remark?: string;
   status: ContractStatus;
+
   createdBy?: string;
   createdAt: number;
   updatedAt: number;
+
   activatedAt?: number;
   activatedBy?: string;
-  /** Set when the contract reached its value or Finance requested review. */
-  readyAt?: number;
+
   completionConfirmedAt?: number;
   completionConfirmedBy?: string;
-  /** Recorded reason when Finance closes/confirms below the contract value. */
   completionReason?: string;
   closedBelowValue?: boolean;
-  /**
-   * Finance-recorded payment information. Optional at creation, editable after
-   * completion, and NEVER a payment confirmation by itself.
-   */
+
+  /** Finance-recorded payment information. */
   payment?: ContractPaymentInformation;
-  /** Optional withholding decision; the amount is always derived. */
   withholding?: ContractWithholdingInformation;
-  /** Append-only audit trail of payment/withholding changes. */
   paymentHistory?: ContractPaymentHistoryEntry[];
-  cancelledAt?: number;
-  cancelledBy?: string;
-  cancellationReason?: string;
-  /** Resulting Sales Invoice (set only after invoice creation succeeded). */
-  salesInvoiceId?: string;
-  salesInvoiceNumber?: string;
-  convertedAt?: number;
-  convertedBy?: string;
-  /** Retry guard: set while a conversion attempt is running. */
-  conversionStartedAt?: number;
-  conversionError?: string;
-  /** Append-only lifecycle history. */
+
   statusHistory: ContractStatusHistoryEntry[];
 }
 
-/** One individual order completed under a contract. */
 export interface ContractOrder {
   id: string;
   contractId: string;
-  /** Sequential display number inside the contract — "Order 1", "Order 2". */
   orderNumber: number;
   aggregate: AggregateType;
   quantity: number;
   unit: string;
-  /** Unit price in ETB per m³, stored per order — later price changes never
-   *  recalculate historical orders. */
   unitPrice: number;
-  /** VAT-EXCLUSIVE line total (royalty base): quantity × unitPrice. */
+
+  /** VAT-exclusive royalty calculation base. */
   lineTotalExclVat: number;
-  /** VAT-INCLUSIVE line total (contract fulfillment basis). */
+
+  /** VAT-inclusive contract reservation/fulfillment amount. */
   lineTotalInclVat: number;
-  /** Royalty Invoice Number — per order, supplied by the user (never invented). */
+
   royaltyInvoiceNumber?: string;
   orderDate: number;
   status: ContractOrderStatus;
-  /**
-   * Business-facing "Completed By" — the salesperson who completed the order.
-   * Preserved across corrections; the editor is recorded separately below.
-   */
+
   completedByUserId: string;
   completedByName: string;
   completedByEmail?: string;
   completedAt: number;
+
   createdByUserId: string;
   createdByName: string;
   createdAt: number;
   updatedAt: number;
-  /** Audit: who corrected the order most recently (never replaces Completed By). */
+
   lastEditedByUserId?: string;
   lastEditedByName?: string;
   lastEditedByEmail?: string;
   editedAt?: number;
+
   cancelledAt?: number;
   cancelledBy?: string;
   cancelReason?: string;
-  /** Stable link to this order's Royalty Report entry. */
+
   royaltySourceKey: string;
 }
 
 /* ------------------------------------------------------------------ */
-/* Inputs                                                             */
+/* Inputs                                                              */
 /* ------------------------------------------------------------------ */
 
 export interface ContractInput {
@@ -247,6 +200,10 @@ export interface ContractInput {
   contractDate: number;
   attachments?: ContractAttachment[];
   remark?: string;
+
+  /** Required when creating a contract. */
+  payment?: ContractPaymentInput | null;
+  withholding?: ContractWithholdingInput;
 }
 
 export interface ContractOrderInput {
@@ -261,21 +218,32 @@ export interface ContractOrderInput {
 /* Numbering + calculations                                            */
 /* ------------------------------------------------------------------ */
 
-/** Next sequential contract number: CONTRACT-0001, CONTRACT-0002, ... */
 export function computeNextContractNumber(
   contracts: { contractNumber: string }[],
 ): string {
   let max = 0;
+
   for (const contract of contracts) {
     const match = /^CONTRACT-(\d+)$/.exec(contract.contractNumber);
-    if (match) max = Math.max(max, parseInt(match[1], 10));
+
+    if (match) {
+      max = Math.max(max, parseInt(match[1], 10));
+    }
   }
+
   return `CONTRACT-${String(max + 1).padStart(4, "0")}`;
 }
 
 /**
- * The ONE contract-order money calculation. Quantity and unit price are the
- * stored order values; nothing is recalculated from the contract.
+ * Calculate contract order totals using the VAT-inclusive payable basis.
+ *
+ * Calculation order:
+ * 1. Normalize quantity and unit price.
+ * 2. Calculate and round the VAT-exclusive subtotal.
+ * 3. Apply 15% VAT to that rounded subtotal.
+ * 4. Round the VAT-inclusive total to two decimal places.
+ *
+ * This avoids floating-point discrepancies such as 299999.9999.
  */
 export function calculateContractOrderTotals(order: {
   quantity: unknown;
@@ -283,24 +251,27 @@ export function calculateContractOrderTotals(order: {
 }): { lineTotalExclVat: number; lineTotalInclVat: number } {
   const quantity = Math.max(0, normalizeNumber(order.quantity));
   const unitPrice = Math.max(0, normalizeNumber(order.unitPrice));
+
   const lineTotalExclVat = roundMoney(quantity * unitPrice);
+
+  const lineTotalInclVat = roundMoney(
+    lineTotalExclVat * VAT_DIVISOR,
+  );
+
   return {
     lineTotalExclVat,
-    lineTotalInclVat: roundMoney(lineTotalExclVat * VAT_DIVISOR),
+    lineTotalInclVat,
   };
 }
 
-/** Stable Royalty Report source reference for a contract order. */
 export function royaltySourceKeyForOrder(orderId: string): string {
   return `contract-order:${orderId}`;
 }
 
-/**
- * A contract order belongs in the Royalty Report only once it has actually
- * been completed and saved. A cancelled order keeps its record and audit
- * trail but no longer contributes an active royalty amount.
- */
-export function isContractOrderRoyaltyReported(order: ContractOrder): boolean {
+/** Only Finance-approved orders are royalty-reported. */
+export function isContractOrderRoyaltyReported(
+  order: ContractOrder,
+): boolean {
   return order.status === CONTRACT_ORDER_STATUS.COMPLETED;
 }
 
@@ -310,30 +281,37 @@ export function isContractOrderRoyaltyReported(order: ContractOrder): boolean {
 
 export interface ContractProgress {
   contractValue: number;
-  /** Fulfilled value — VAT-inclusive total of the contract's COMPLETED orders. */
+
+  /** Finance-approved order value. */
   fulfilledValue: number;
-  /** Contract Value − Fulfilled Value, never negative. */
+
+  /** Value reserved by pending orders awaiting Finance approval. */
+  reservedValue: number;
+
+  /** Remaining value after approved fulfillment only. */
   remainingValue: number;
-  /** True when fulfilled value exceeds the contract value. */
+
+  /** Available value for creating additional orders. */
+  availableValue: number;
+
+  /** True when approved fulfillment plus pending reservations exceed value. */
   overFulfilled: boolean;
+
+  /** Non-cancelled orders only. */
   orderCount: number;
   completedOrderCount: number;
-  /**
-   * Displayed fulfillment percentage — zero-safe and capped with
-   * Math.min(100, …) so a contract can never display more than 100%.
-   */
+  pendingOrderCount: number;
+
+  /** Official progress based only on Finance-approved orders. */
   fulfillmentPercent: number;
-  /** Unclamped percentage, kept for financial transparency only. */
+
+  /** Uncapped official fulfillment percentage. */
   rawFulfillmentPercent: number;
-  /** True when the contract has reached its full contract value. */
+
+  /** True only when approved fulfillment reaches contract value. */
   reachedValue: boolean;
 }
 
-/**
- * Contract progress on the documented VAT-INCLUSIVE payable basis.
- * Cancelled orders and orders of other contracts are excluded by callers.
- * Zero contract values never divide by zero.
- */
 export function getContractProgress(
   contract: Pick<Contract, "contractValue">,
   orders: Pick<
@@ -341,34 +319,107 @@ export function getContractProgress(
     "status" | "lineTotalInclVat" | "lineTotalExclVat" | "quantity"
   >[],
 ): ContractProgress {
-  const contractValue = Math.max(0, normalizeNumber(contract.contractValue));
-  const active = orders.filter(
+  const contractValue = Math.max(
+    0,
+    normalizeNumber(contract.contractValue),
+  );
+
+  // Cancelled orders do not count toward fulfillment, reservations,
+  // progress, or active order count.
+  const activeOrders = orders.filter(
+    (order) => order.status !== CONTRACT_ORDER_STATUS.CANCELLED,
+  );
+
+  // Finance-approved orders count toward official fulfillment.
+  const completed = activeOrders.filter(
     (order) => order.status === CONTRACT_ORDER_STATUS.COMPLETED,
   );
+
+  // Pending orders reserve contract capacity.
+  const pending = activeOrders.filter(
+    (order) => order.status === CONTRACT_ORDER_STATUS.PENDING,
+  );
+
   const fulfilledValue = roundMoney(
-    active.reduce(
+    completed.reduce(
       (sum, order) => sum + normalizeNumber(order.lineTotalInclVat),
       0,
     ),
   );
-  const remainingRaw = roundMoney(contractValue - fulfilledValue);
-  const reachedValue = contractValue > 0 && fulfilledValue >= contractValue;
+
+  const reservedValue = roundMoney(
+    pending.reduce(
+      (sum, order) => sum + normalizeNumber(order.lineTotalInclVat),
+      0,
+    ),
+  );
+
+  // Official remaining fulfillment excludes only approved orders.
+  const remainingValue = Math.max(
+    0,
+    roundMoney(contractValue - fulfilledValue),
+  );
+
+  // Available ordering capacity excludes approved and pending orders.
+  const committedValue = roundMoney(
+    fulfilledValue + reservedValue,
+  );
+
+  const availableValue = Math.max(
+    0,
+    roundMoney(contractValue - committedValue),
+  );
+
   const rawPercent =
     contractValue > 0
-      ? Math.round((fulfilledValue / contractValue) * 10000) / 100
+      ? (fulfilledValue / contractValue) * 100
       : 0;
+
+  const rawFulfillmentPercent =
+    Math.round((rawPercent + Number.EPSILON) * 100) / 100;
+
+  const reachedValue =
+    contractValue > 0 && fulfilledValue >= contractValue;
+
   return {
     contractValue,
     fulfilledValue,
-    remainingValue: Math.max(0, remainingRaw),
-    overFulfilled: fulfilledValue > contractValue,
-    orderCount: orders.length,
-    completedOrderCount: active.length,
-    // The displayed percentage is capped; the real fulfilled amount is not.
-    fulfillmentPercent: Math.max(0, Math.min(100, rawPercent)),
-    rawFulfillmentPercent: rawPercent,
+    reservedValue,
+    remainingValue,
+    availableValue,
+    overFulfilled: committedValue > contractValue,
+    orderCount: activeOrders.length,
+    completedOrderCount: completed.length,
+    pendingOrderCount: pending.length,
+    fulfillmentPercent: Math.max(
+      0,
+      Math.min(100, rawFulfillmentPercent),
+    ),
+    rawFulfillmentPercent,
     reachedValue,
   };
+}
+
+/**
+ * A contract can accept another order only when:
+ * - its lifecycle status is ACTIVE;
+ * - it has a positive contract value;
+ * - available capacity remains after approved and pending orders.
+ */
+export function canAddOrders(
+  contract: Pick<Contract, "status" | "contractValue">,
+  orders: Pick<
+    ContractOrder,
+    "status" | "lineTotalInclVat" | "lineTotalExclVat" | "quantity"
+  >[],
+): boolean {
+  if (!canAcceptOrders(contract.status)) return false;
+
+  if (normalizeNumber(contract.contractValue) <= 0) {
+    return false;
+  }
+
+  return getContractProgress(contract, orders).availableValue > 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,63 +431,126 @@ export interface ValidationResult {
   errors: Record<string, string>;
 }
 
-/** Contract form validation (Finance). */
-export function validateContractInput(input: ContractInput): ValidationResult {
+export function validateContractInput(
+  input: ContractInput,
+): ValidationResult {
   const errors: Record<string, string> = {};
+
   if (!input.customerName?.trim()) {
     errors.customerName = "Customer / Company Name is required";
   }
-  if (!input.tin?.trim()) errors.tin = "Customer TIN Number is required";
-  if (!input.fsNo?.trim()) errors.fsNo = "FS No is required";
-  const value = normalizeNumber(input.contractValue);
-  if (!Number.isFinite(input.contractValue) || value < 0) {
-    errors.contractValue = "Enter a valid contract value in ETB";
+
+  if (!input.tin?.trim()) {
+    errors.tin = "Customer TIN Number is required";
   }
-  if (!input.contractDate || Number.isNaN(new Date(input.contractDate).getTime())) {
+
+  if (!input.fsNo?.trim()) {
+    errors.fsNo = "FS No is required";
+  }
+
+  const value = normalizeNumber(input.contractValue);
+
+  if (!Number.isFinite(input.contractValue) || value <= 0) {
+    errors.contractValue = "Enter a contract value greater than zero";
+  }
+
+  if (
+    !input.contractDate ||
+    Number.isNaN(new Date(input.contractDate).getTime())
+  ) {
     errors.contractDate = "A valid contract date is required";
   }
-  return { valid: Object.keys(errors).length === 0, errors };
+
+  // Payment information is mandatory during contract creation.
+  if (!input.payment) {
+    errors.payment =
+      "Payment information is required when creating a contract";
+  } else {
+    const reportedAmount = normalizeNumber(input.payment.paymentAmount);
+
+    if (
+      !Number.isFinite(input.payment.paymentAmount) ||
+      reportedAmount < value
+    ) {
+      errors.paymentAmount =
+        "Reported amount cannot be less than the contract value";
+    }
+  }
+
+  return {
+    valid: Object.keys(errors).length === 0,
+    errors,
+  };
 }
 
-/**
- * Contract order validation. Required fields follow the existing Sales
- * Invoice order rules (aggregate 00/01/02, quantity > 0, valid unit price,
- * Royalty Invoice Number required on the order form) plus the order date.
- */
 export function validateContractOrderInput(
   input: ContractOrderInput,
 ): ValidationResult {
   const errors: Record<string, string> = {};
-  if (!(AGGREGATE_TYPES as readonly string[]).includes(String(input.aggregate))) {
+
+  if (
+    !(AGGREGATE_TYPES as readonly string[]).includes(
+      String(input.aggregate),
+    )
+  ) {
     errors.aggregate = "Aggregate (00, 01 or 02) is required";
   }
+
   const quantity = normalizeNumber(input.quantity);
+
   if (!Number.isFinite(input.quantity) || quantity <= 0) {
     errors.quantity = "Quantity must be greater than zero";
   }
+
   const unitPrice = normalizeNumber(input.unitPrice);
+
   if (!Number.isFinite(input.unitPrice) || unitPrice < 0) {
     errors.unitPrice = "Enter a valid unit price";
   }
+
   if (!input.royaltyInvoiceNumber?.trim()) {
     errors.royaltyInvoiceNumber = "Royalty Invoice Number is required";
   }
-  if (!input.orderDate || Number.isNaN(new Date(input.orderDate).getTime())) {
+
+  if (
+    !input.orderDate ||
+    Number.isNaN(new Date(input.orderDate).getTime())
+  ) {
     errors.orderDate = "A valid order date is required";
   }
-  return { valid: Object.keys(errors).length === 0, errors };
+
+  return {
+    valid: Object.keys(errors).length === 0,
+    errors,
+  };
 }
 
-/** Attachment validation — type convention; the project has no size rule. */
 export function validateContractAttachment(file: {
   name: string;
   type: string;
   size: number;
 }): ValidationResult {
   const errors: Record<string, string> = {};
-  if (!file.name?.trim()) errors.fileName = "A file name is required";
-  if (!isAcceptedContractAttachmentType(file.type)) {
-    errors.mimeType = "Only PDF, JPG, and PNG files are accepted";
+
+  if (!file.name?.trim()) {
+    errors.fileName = "A file name is required";
   }
-  return { valid: Object.keys(errors).length === 0, errors };
+
+  if (!isAcceptedContractAttachmentType(file.type)) {
+    errors.mimeType =
+      "Only PDF, JPEG, PNG, and WebP files are accepted";
+  }
+
+  if (
+    !Number.isFinite(file.size) ||
+    file.size < 0 ||
+    file.size > MAX_CONTRACT_ATTACHMENT_BYTES
+  ) {
+    errors.fileSize = "File size must be a valid value not exceeding 10 MB";
+  }
+
+  return {
+    valid: Object.keys(errors).length === 0,
+    errors,
+  };
 }

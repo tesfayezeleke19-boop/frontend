@@ -1,3 +1,4 @@
+
 /**
  * React hooks for the Admin read-only reporting layer.
  *
@@ -27,13 +28,17 @@ import type {
   AdminSalesReportData,
   AdminFinancialReportData,
   AdminHRReportData,
-  AdminOverallReportData,
 } from "@/services/admin";
 
 export interface AdminDataState<T> {
   data: T | null;
   loading: boolean;
   error: Error | null;
+}
+
+export interface AdminPeriodFilters {
+  year?: number;
+  month?: number;
 }
 
 function useAdminData<T>(
@@ -52,14 +57,23 @@ function useAdminData<T>(
     const load = () => {
       loader().then(
         (data) => {
-          if (active) setState({ data, loading: false, error: null });
+          if (active) {
+            setState({
+              data,
+              loading: false,
+              error: null,
+            });
+          }
         },
         (error: unknown) => {
           if (active) {
             setState({
               data: null,
               loading: false,
-              error: error instanceof Error ? error : new Error(String(error)),
+              error:
+                error instanceof Error
+                  ? error
+                  : new Error(String(error)),
             });
           }
         },
@@ -67,6 +81,7 @@ function useAdminData<T>(
     };
 
     load();
+
     const unsubSales = subscribeSales(load);
     const unsubFinance = subscribeFinance(load);
 
@@ -75,61 +90,119 @@ function useAdminData<T>(
       unsubSales();
       unsubFinance();
     };
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 
   return state;
 }
 
-export function useAdminSalesOverview(): AdminDataState<AdminSalesOverview> {
-  const loader = useCallback(() => getAdminSalesOverview(), []);
-  return useAdminData(loader);
+/* ------------------------------------------------------------------ */
+/* Overview Hooks                                                      */
+/* ------------------------------------------------------------------ */
+
+export function useAdminSalesOverview(
+  filters?: AdminPeriodFilters,
+): AdminDataState<AdminSalesOverview> {
+  const key = JSON.stringify(filters ?? {});
+
+  const loader = useCallback(
+    () => getAdminSalesOverview(filters),
+    [key],
+  );
+
+  return useAdminData(loader, [key]);
 }
 
-export function useAdminFinanceOverview(): AdminDataState<AdminFinanceOverview> {
-  const loader = useCallback(() => getAdminFinanceOverview(), []);
-  return useAdminData(loader);
+export function useAdminFinanceOverview(
+  filters?: AdminPeriodFilters,
+): AdminDataState<AdminFinanceOverview> {
+  const key = JSON.stringify(filters ?? {});
+
+  const loader = useCallback(
+    () => getAdminFinanceOverview(filters),
+    [key],
+  );
+
+  return useAdminData(loader, [key]);
 }
 
 export function useAdminHROverview(): AdminDataState<AdminHROverview> {
-  const loader = useCallback(() => getAdminHROverview(), []);
+  const loader = useCallback(
+    () => getAdminHROverview(),
+    [],
+  );
+
   return useAdminData(loader);
 }
 
 export function useAdminMonthlyFinancials(
   year?: number,
+  month?: number,
 ): AdminDataState<AdminMonthlyFinancialRow[]> {
-  const loader = useCallback(() => getAdminMonthlyFinancials(year), [year]);
-  return useAdminData(loader, [year]);
+  const loader = useCallback(
+    () => getAdminMonthlyFinancials(year, month),
+    [year, month],
+  );
+
+  return useAdminData(loader, [year, month]);
 }
 
+/* ------------------------------------------------------------------ */
+/* Overall Summary Hook                                                */
+/* ------------------------------------------------------------------ */
+
 export function useAdminOverallSummary(): AdminDataState<AdminOverallSummary> {
-  const loader = useCallback(() => getAdminOverallSummary(), []);
+  const loader = useCallback(
+    () => getAdminOverallSummary(),
+    [],
+  );
+
   return useAdminData(loader);
 }
 
+/* ------------------------------------------------------------------ */
+/* Report Hooks                                                        */
+/* ------------------------------------------------------------------ */
+
 export function useAdminSalesReport(
-  filters?: { year?: number; month?: number },
+  filters?: AdminPeriodFilters,
 ): AdminDataState<AdminSalesReportData> {
-  const key = JSON.stringify(filters);
-  const loader = useCallback(() => getAdminSalesReport(filters), [key]);
+  const key = JSON.stringify(filters ?? {});
+
+  const loader = useCallback(
+    () => getAdminSalesReport(filters),
+    [key],
+  );
+
   return useAdminData(loader, [key]);
 }
 
 export function useAdminFinancialReport(
-  filters?: { year?: number; month?: number },
+  filters?: AdminPeriodFilters,
 ): AdminDataState<AdminFinancialReportData> {
-  const key = JSON.stringify(filters);
-  const loader = useCallback(() => getAdminFinancialReport(filters), [key]);
+  const key = JSON.stringify(filters ?? {});
+
+  const loader = useCallback(
+    () => getAdminFinancialReport(filters),
+    [key],
+  );
+
   return useAdminData(loader, [key]);
 }
 
 export function useAdminHRReport(
-  filters?: { status?: "active" | "inactive"; position?: string },
+  filters?: {
+    status?: "active" | "inactive";
+    position?: string;
+  },
 ): AdminDataState<AdminHRReportData> {
-  const key = JSON.stringify(filters);
-  const loader = useCallback(() => getAdminHRReport(filters), [key]);
+  const key = JSON.stringify(filters ?? {});
+
+  const loader = useCallback(
+    () => getAdminHRReport(filters),
+    [key],
+  );
+
   return useAdminData(loader, [key]);
 }
-
-

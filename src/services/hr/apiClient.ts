@@ -977,3 +977,5 @@ export function useMockHRClient(): void {
 export function resetHRApiClient(): void {
   _client = null;
 }
+
+export { HR_API_BASE_URL };

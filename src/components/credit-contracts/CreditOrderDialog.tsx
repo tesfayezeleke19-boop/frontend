@@ -1,3 +1,4 @@
+
 import { useEffect, useState } from "react";
 import {
   Dialog,
@@ -279,12 +280,6 @@ export function CreditOrderDialog({
           <DialogTitle className="font-heading text-lg font-semibold text-foreground">
             {isEditing ? "Edit Order" : "Add Order"}
           </DialogTitle>
-
-          <DialogDescription className="text-sm text-muted-foreground">
-            {isEditing
-              ? "Correct the order details. The original salesperson attribution is preserved; you are recorded as the editor."
-              : "Add a completed order against the selected credit contract. Your name is recorded automatically as the salesperson who completed the order."}
-          </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4 pt-2">

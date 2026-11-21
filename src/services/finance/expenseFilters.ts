@@ -1,3 +1,4 @@
+
 /**
  * Expense date-range + search filtering — ONE implementation shared by the
  * Finance Expenses page and the verification scripts, so the tested
@@ -7,6 +8,7 @@
  * weeks run Monday 00:00 → Sunday 23:59 — consistent with the Finance
  * Transactions date filters. Filters never modify records.
  */
+
 import { EXPENSE_TYPE_LABELS, expenseTypeOf, type Expense } from "./types";
 
 export type ExpenseRangeKind =
@@ -38,35 +40,123 @@ export const EXPENSE_RANGE_OPTIONS: {
   { value: "CUSTOM", label: "Custom range" },
 ];
 
+/** Start of a local calendar day. */
 export function startOfLocalDay(ts: number): number {
   const d = new Date(ts);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
 }
 
+/** End of a local calendar day. */
 export function endOfLocalDay(ts: number): number {
   const d = new Date(ts);
   d.setHours(23, 59, 59, 999);
   return d.getTime();
 }
 
+/**
+ * Convert an expense transaction date into a local timestamp.
+ *
+ * API expense dates commonly arrive as YYYY-MM-DD strings. Parsing those
+ * directly with new Date() treats them as UTC, which can shift the calendar
+ * day in local time zones. Parse date-only values using local date parts.
+ */
+export function getExpenseDateTimestamp(
+  expenseDate: Expense["date"] | string | null | undefined,
+): number | null {
+  if (!expenseDate) return null;
+
+  if (typeof expenseDate === "string") {
+    const dateOnlyMatch = expenseDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+    if (dateOnlyMatch) {
+      const year = Number(dateOnlyMatch[1]);
+      const month = Number(dateOnlyMatch[2]);
+      const day = Number(dateOnlyMatch[3]);
+
+      const localDate = new Date(year, month - 1, day);
+
+      if (
+        localDate.getFullYear() !== year ||
+        localDate.getMonth() !== month - 1 ||
+        localDate.getDate() !== day
+      ) {
+        return null;
+      }
+
+      return localDate.getTime();
+    }
+  }
+
+  const timestamp = new Date(expenseDate).getTime();
+
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+/**
+ * Check whether an expense transaction date falls inside a resolved range.
+ * The comparison uses the expense's local calendar day.
+ */
+export function matchesExpenseDateRange(
+  expense: Expense,
+  range: ExpenseDateRange | null,
+): boolean {
+  if (!range) return true;
+
+  const timestamp = getExpenseDateTimestamp(expense.date);
+
+  if (timestamp === null) return false;
+
+  const expenseDay = startOfLocalDay(timestamp);
+
+  return (
+    expenseDay >= startOfLocalDay(range.start) &&
+    expenseDay <= startOfLocalDay(range.end)
+  );
+}
+
 /** Monday 00:00 → Sunday 23:59 (offset −1 = last week). */
-export function localWeekRange(now: Date, offset: number): ExpenseDateRange {
-  const mondayOffset = (now.getDay() + 6) % 7; // Monday = 0
+export function localWeekRange(
+  now: Date,
+  offset: number,
+): ExpenseDateRange {
+  const mondayOffset = (now.getDay() + 6) % 7;
+
   const monday = new Date(
     now.getFullYear(),
     now.getMonth(),
     now.getDate() - mondayOffset + offset * 7,
   );
+
   const sunday = new Date(monday);
   sunday.setDate(monday.getDate() + 6);
-  return { start: startOfLocalDay(monday.getTime()), end: endOfLocalDay(sunday.getTime()) };
+
+  return {
+    start: startOfLocalDay(monday.getTime()),
+    end: endOfLocalDay(sunday.getTime()),
+  };
 }
 
-function localMonthRange(now: Date, offset: number): ExpenseDateRange {
-  const first = new Date(now.getFullYear(), now.getMonth() + offset, 1);
-  const last = new Date(now.getFullYear(), now.getMonth() + offset + 1, 0);
-  return { start: startOfLocalDay(first.getTime()), end: endOfLocalDay(last.getTime()) };
+function localMonthRange(
+  now: Date,
+  offset: number,
+): ExpenseDateRange {
+  const first = new Date(
+    now.getFullYear(),
+    now.getMonth() + offset,
+    1,
+  );
+
+  const last = new Date(
+    now.getFullYear(),
+    now.getMonth() + offset + 1,
+    0,
+  );
+
+  return {
+    start: startOfLocalDay(first.getTime()),
+    end: endOfLocalDay(last.getTime()),
+  };
 }
 
 /**
@@ -82,34 +172,73 @@ export function resolveExpenseDateRange(
   switch (kind) {
     case "ALL_TIME":
       return { range: null };
+
     case "TODAY":
       return {
-        range: { start: startOfLocalDay(now.getTime()), end: endOfLocalDay(now.getTime()) },
+        range: {
+          start: startOfLocalDay(now.getTime()),
+          end: endOfLocalDay(now.getTime()),
+        },
       };
+
     case "YESTERDAY": {
-      const y = startOfLocalDay(now.getTime()) - 24 * 60 * 60 * 1000;
-      return { range: { start: y, end: endOfLocalDay(y) } };
+      const yesterday = new Date(now);
+      yesterday.setDate(yesterday.getDate() - 1);
+
+      return {
+        range: {
+          start: startOfLocalDay(yesterday.getTime()),
+          end: endOfLocalDay(yesterday.getTime()),
+        },
+      };
     }
+
     case "THIS_WEEK":
       return { range: localWeekRange(now, 0) };
+
     case "LAST_WEEK":
       return { range: localWeekRange(now, -1) };
+
     case "THIS_MONTH":
       return { range: localMonthRange(now, 0) };
+
     case "LAST_MONTH":
       return { range: localMonthRange(now, -1) };
+
     case "CUSTOM": {
-      const from = customFrom ? new Date(`${customFrom}T00:00:00`).getTime() : null;
-      const to = customTo ? new Date(`${customTo}T23:59:59.999`).getTime() : null;
-      if (customFrom && Number.isNaN(from as number))
+      const from = customFrom
+        ? new Date(`${customFrom}T00:00:00`).getTime()
+        : null;
+
+      const to = customTo
+        ? new Date(`${customTo}T23:59:59.999`).getTime()
+        : null;
+
+      if (customFrom && Number.isNaN(from as number)) {
         return { range: null, error: "Invalid start date" };
-      if (customTo && Number.isNaN(to as number))
-        return { range: null, error: "Invalid end date" };
-      if (from !== null && to !== null && from > to) {
-        return { range: null, error: "Start date must not be after the end date" };
       }
-      if (from === null && to === null) return { range: null };
-      return { range: { start: from ?? 0, end: to ?? Number.MAX_SAFE_INTEGER } };
+
+      if (customTo && Number.isNaN(to as number)) {
+        return { range: null, error: "Invalid end date" };
+      }
+
+      if (from !== null && to !== null && from > to) {
+        return {
+          range: null,
+          error: "Start date must not be after the end date",
+        };
+      }
+
+      if (from === null && to === null) {
+        return { range: null };
+      }
+
+      return {
+        range: {
+          start: from ?? 0,
+          end: to ?? Number.MAX_SAFE_INTEGER,
+        },
+      };
     }
   }
 }
@@ -123,7 +252,9 @@ export function matchesExpenseSearch(
   query: string,
 ): boolean {
   const q = query.trim().toLowerCase();
+
   if (!q) return true;
+
   return (
     expense.item.toLowerCase().includes(q) ||
     (expense.category ?? "").toLowerCase().includes(q) ||

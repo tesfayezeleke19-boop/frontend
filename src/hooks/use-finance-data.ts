@@ -1,4 +1,3 @@
-
 /**
  * React hooks for the Finance repository layer.
  *
@@ -6,7 +5,7 @@
  * Royalty report rows are loaded from the Finance backend API.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { subscribeSales } from "@/services/sales/storage";
 import { subscribeFinance } from "@/services/finance/storage";
 import { subscribeContracts } from "@/services/contracts/storage";
@@ -35,6 +34,8 @@ export interface RepoState<T> {
   data: T | null;
   loading: boolean;
   error: Error | null;
+  /** Manual recovery refresh; successful mutations notify subscribers instead. */
+  refresh: () => void;
 }
 
 function useRepoData<T>(loader: () => Promise<T>): RepoState<T> {
@@ -42,24 +43,29 @@ function useRepoData<T>(loader: () => Promise<T>): RepoState<T> {
     data: null,
     loading: true,
     error: null,
+    refresh: () => undefined,
   });
+  const [reloadToken, setReloadToken] = useState(0);
+  const requestId = useRef(0);
 
   useEffect(() => {
     let active = true;
 
     const load = () => {
+      const currentRequest = ++requestId.current;
       loader().then(
         (data) => {
-          if (active) {
+          if (active && currentRequest === requestId.current) {
             setState({
               data,
               loading: false,
               error: null,
+              refresh: () => setReloadToken((token) => token + 1),
             });
           }
         },
         (error: unknown) => {
-          if (active) {
+          if (active && currentRequest === requestId.current) {
             setState({
               data: null,
               loading: false,
@@ -67,6 +73,7 @@ function useRepoData<T>(loader: () => Promise<T>): RepoState<T> {
                 error instanceof Error
                   ? error
                   : new Error(String(error)),
+              refresh: () => setReloadToken((token) => token + 1),
             });
           }
         },
@@ -85,7 +92,7 @@ function useRepoData<T>(loader: () => Promise<T>): RepoState<T> {
       unsubscribeFinanceChanges();
       unsubscribeContractChanges();
     };
-  }, [loader]);
+  }, [loader, reloadToken]);
 
   return state;
 }
@@ -99,7 +106,6 @@ export function useFinancialRecords(): RepoState<FinancialRecord[]> {
   return useRepoData(loader);
 }
 
-
 export function useFinanceSummary(
   year?: number,
   month?: number | null,
@@ -112,9 +118,15 @@ export function useFinanceSummary(
   return useRepoData(loader);
 }
 
+export function useFinancialReports(
+  year?: number,
+  month?: number | null,
+): RepoState<FinancialReportsData> {
+  const loader = useCallback(
+    () => getFinancialReports(year, month),
+    [year, month],
+  );
 
-export function useFinancialReports(): RepoState<FinancialReportsData> {
-  const loader = useCallback(() => getFinancialReports(), []);
   return useRepoData(loader);
 }
 
